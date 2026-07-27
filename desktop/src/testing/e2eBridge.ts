@@ -138,6 +138,19 @@ type MockSearchProfileSeed = {
   isAgent?: boolean;
 };
 
+type MockHuddleMemberSeed = {
+  pubkey: string;
+  role: "owner" | "admin" | "member" | "guest" | "bot";
+};
+
+type MockHuddleSeed = {
+  parentChannelId: string;
+  ephemeralChannelId: string;
+  members: MockHuddleMemberSeed[];
+  transcriptionEnabled?: boolean;
+  isCreator?: boolean;
+};
+
 type E2eConfig = {
   mode?: "mock" | "relay";
   mock?: {
@@ -226,6 +239,8 @@ type E2eConfig = {
     personas?: MockPersonaSeed[];
     teams?: MockTeamSeed[];
     relayAgents?: MockRelayAgentSeed[];
+    /** Native-like huddle state seeded from authoritative role-bearing membership. */
+    huddle?: MockHuddleSeed;
     agentListDelayMs?: number;
     agentMemory?: RawAgentMemoryListing | Record<string, RawAgentMemoryListing>;
     addChannelMembersDelayMs?: number;
@@ -1030,6 +1045,10 @@ declare global {
       command: string,
       payload?: Record<string, unknown>,
     ) => Promise<unknown>;
+    __BUZZ_E2E_SET_MOCK_HUDDLE_SNAPSHOT__?: (input: {
+      members: MockHuddleMemberSeed[];
+      transcriptionEnabled: boolean;
+    }) => void;
     __BUZZ_E2E_PUSH_MOCK_FEED_ITEM__?: (item: RawFeedItem) => RawFeedItem;
     /** Replace an existing feed item by id (or push if not found) and fire the updated event. */
     __BUZZ_E2E_REPLACE_MOCK_FEED_ITEM__?: (
@@ -2880,7 +2899,90 @@ function resetMockMesh() {
 let mockPersonas: RawPersona[] = [];
 let mockTeams: RawTeam[] = [];
 // Listeners registered via the mock __TAURI_INTERNALS__.listen — keyed by event name.
-const tauriEventListeners = new Map<string, Set<() => void>>();
+type MockTauriEvent = { payload: unknown };
+type MockTauriEventCallback = (event: MockTauriEvent) => void;
+const tauriEventListeners = new Map<string, Set<MockTauriEventCallback>>();
+
+type MockHuddleState = {
+  phase: "active";
+  parent_channel_id: string;
+  ephemeral_channel_id: string;
+  participants: string[];
+  agent_pubkeys: string[];
+  tts_enabled: boolean;
+  transcription_enabled: boolean;
+  is_creator: boolean;
+  voice_input_mode: "voice_activity";
+};
+
+type PersistedMockHuddle = {
+  members: MockHuddleMemberSeed[];
+  state: MockHuddleState;
+};
+
+const MOCK_HUDDLE_STORAGE_KEY = "buzz.e2e.mock-huddle.v1";
+let mockHuddle: PersistedMockHuddle | null = null;
+
+function persistMockHuddle() {
+  if (mockHuddle) {
+    window.sessionStorage.setItem(
+      MOCK_HUDDLE_STORAGE_KEY,
+      JSON.stringify(mockHuddle),
+    );
+  }
+}
+
+function emitMockHuddleState() {
+  if (!mockHuddle) return;
+  for (const cb of tauriEventListeners.get("huddle-state-changed") ?? []) {
+    cb({ payload: structuredClone(mockHuddle.state) });
+  }
+}
+
+function refreshMockHuddleMembership() {
+  if (!mockHuddle) return;
+  mockHuddle.state.agent_pubkeys = mockHuddle.members
+    .filter((member) => member.role === "bot")
+    .map((member) => member.pubkey);
+  mockHuddle.state.participants = mockHuddle.members.map(
+    (member) => member.pubkey,
+  );
+}
+
+function initializeMockHuddle(seed: MockHuddleSeed | undefined) {
+  mockHuddle = null;
+  if (!seed) {
+    window.sessionStorage.removeItem(MOCK_HUDDLE_STORAGE_KEY);
+    return;
+  }
+
+  const persisted = window.sessionStorage.getItem(MOCK_HUDDLE_STORAGE_KEY);
+  if (persisted) {
+    try {
+      mockHuddle = JSON.parse(persisted) as PersistedMockHuddle;
+      return;
+    } catch {
+      window.sessionStorage.removeItem(MOCK_HUDDLE_STORAGE_KEY);
+    }
+  }
+
+  mockHuddle = {
+    members: structuredClone(seed.members),
+    state: {
+      phase: "active",
+      parent_channel_id: seed.parentChannelId,
+      ephemeral_channel_id: seed.ephemeralChannelId,
+      participants: [],
+      agent_pubkeys: [],
+      tts_enabled: false,
+      transcription_enabled: seed.transcriptionEnabled ?? false,
+      is_creator: seed.isCreator ?? true,
+      voice_input_mode: "voice_activity",
+    },
+  };
+  refreshMockHuddleMembership();
+  persistMockHuddle();
+}
 const openedExternalUrls: string[] = [];
 const defaultMockRelayAgents: RawRelayAgent[] = [
   {
@@ -9151,6 +9253,7 @@ export function maybeInstallE2eTauriMocks() {
   resetMockUserStatuses();
   resetMockSaveSubscriptions(config);
   resetMockPendingCommunityDeepLinks(config);
+  initializeMockHuddle(config.mock?.huddle);
   mockWebsocketSendMutexWedged = false;
   mockWindows("main");
   window.__BUZZ_E2E_COMMANDS__ = [];
@@ -9158,6 +9261,19 @@ export function maybeInstallE2eTauriMocks() {
   window.__BUZZ_E2E_COMMAND_LOG__ = [];
   window.__BUZZ_E2E_SIGNED_EVENTS__ = [];
   window.__BUZZ_E2E_WEBVIEW_ZOOM__ = 1;
+  window.__BUZZ_E2E_SET_MOCK_HUDDLE_SNAPSHOT__ = ({
+    members,
+    transcriptionEnabled,
+  }) => {
+    if (!mockHuddle) {
+      throw new Error("No mock huddle is configured.");
+    }
+    mockHuddle.members = structuredClone(members);
+    mockHuddle.state.transcription_enabled = transcriptionEnabled;
+    refreshMockHuddleMembership();
+    persistMockHuddle();
+    emitMockHuddleState();
+  };
   window.__BUZZ_E2E_EMIT_MOCK_MESSAGE__ = ({
     channelName,
     content,
@@ -9430,6 +9546,24 @@ export function maybeInstallE2eTauriMocks() {
     window.__BUZZ_E2E_COMMAND_LOG__?.push({ command, payload });
 
     switch (command) {
+      case "get_huddle_state":
+        if (!mockHuddle) return null;
+        return structuredClone(mockHuddle.state);
+      case "get_huddle_agent_pubkeys":
+        if (!mockHuddle) return [];
+        return [...mockHuddle.state.agent_pubkeys];
+      case "set_huddle_transcription_enabled":
+        if (!mockHuddle) {
+          throw new Error("No active mock huddle.");
+        }
+        mockHuddle.state.transcription_enabled = Boolean(
+          (payload as { enabled?: boolean }).enabled,
+        );
+        persistMockHuddle();
+        emitMockHuddleState();
+        return null;
+      case "get_model_status":
+        return { stt: "ready", tts: "ready" };
       case "get_builderlab_auth":
         return activeConfig?.mock?.builderlabAuth ?? null;
       case "start_builderlab_login": {
@@ -10277,7 +10411,7 @@ export function maybeInstallE2eTauriMocks() {
         }
         // Mirror the real Rust backend: emit "agents-data-changed" after reconcile.
         for (const cb of tauriEventListeners.get("agents-data-changed") ?? []) {
-          cb();
+          cb({ payload: null });
         }
         return undefined;
       }
@@ -11268,10 +11402,16 @@ export function maybeInstallE2eTauriMocks() {
   (
     window as unknown as {
       __TAURI_INTERNALS__: {
-        listen?: (event: string, cb: () => void) => Promise<() => void>;
+        listen?: (
+          event: string,
+          cb: MockTauriEventCallback,
+        ) => Promise<() => void>;
       };
     }
-  ).__TAURI_INTERNALS__.listen = async (event: string, cb: () => void) => {
+  ).__TAURI_INTERNALS__.listen = async (
+    event: string,
+    cb: MockTauriEventCallback,
+  ) => {
     let listeners = tauriEventListeners.get(event);
     if (!listeners) {
       listeners = new Set();

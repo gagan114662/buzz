@@ -83,6 +83,17 @@ type MockRelayAgentSeed = {
   status?: "online" | "away" | "offline";
 };
 
+type MockHuddleSeed = {
+  parentChannelId: string;
+  ephemeralChannelId: string;
+  members: Array<{
+    pubkey: string;
+    role: "owner" | "admin" | "member" | "guest" | "bot";
+  }>;
+  transcriptionEnabled?: boolean;
+  isCreator?: boolean;
+};
+
 type MockPersonaSeed = {
   id?: string;
   displayName: string;
@@ -132,6 +143,8 @@ type MockBridgeOptions = {
   projectHeadBranch?: string;
   /** Relay NIP-11 identity used to sign authoritative repository state. */
   relaySelf?: string | null;
+  /** Native-like huddle state seeded from authoritative role-bearing membership. */
+  huddle?: MockHuddleSeed;
   /** Builderlab account returned by hosted-community onboarding. Null/omitted = signed out. */
   builderlabAuth?: { email?: string; name?: string; expiresAt: string } | null;
   /** Optional policy returned by the native join-policy discovery command. */
