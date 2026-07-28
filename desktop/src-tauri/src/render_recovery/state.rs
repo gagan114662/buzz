@@ -13,12 +13,19 @@
 //! fused with the record write into a single durable step.
 //!
 //! An exclusive claim only serializes the creation of one claim file, which is
-//! not enough on its own: reading the record, validating it, and writing the
+//! not enough on its own: reading the record, deciding from it, and writing the
 //! next phase are three operations, and a writer descheduled between them could
-//! stamp a stale phase onto a newer episode. So every transition runs inside
-//! [`Store::lock`], and every receipt additionally has to prove the record is
-//! still the one it belongs to (`episode::may_advance`). The lock orders
-//! writers; the identity check is what makes a delayed writer harmless.
+//! stamp a stale phase onto a newer episode. So [`Store::transition`] is the
+//! only way to make anything durable, and it is compare-and-transition: it
+//! re-reads the record under the caller's [`Transaction`] and applies the write
+//! only if the record still exactly matches the one the caller decided from.
+//! The lock orders writers; the comparison is what makes a delayed writer
+//! harmless.
+//!
+//! Because the expected source names a *phase* and not merely an identity, the
+//! chain is exact for free: a caller writing `owned` declares that it expects
+//! `started`, so `prepared → owned` is rejected as a mismatch with no separate
+//! ordering rule to keep in step with the phase list.
 
 use serde::{Deserialize, Serialize};
 use std::io::Write as _;
@@ -53,31 +60,6 @@ pub(crate) enum Phase {
     Confirmed,
     /// The ladder ran out of rungs for this package. Terminal.
     Exhausted,
-}
-
-impl Phase {
-    /// Position in the `prepared → started → owned → confirmed` chain, used to
-    /// reject a receipt that would move an episode backwards.
-    ///
-    /// `Exhausted` is deliberately above every other phase: it is terminal, and
-    /// a late receipt from the attempt that exhausted the ladder must not
-    /// reopen it.
-    fn rank(self) -> u8 {
-        match self {
-            Phase::Prepared => 0,
-            Phase::Started => 1,
-            Phase::Owned => 2,
-            Phase::Confirmed => 3,
-            Phase::Exhausted => 4,
-        }
-    }
-
-    /// Whether `next` is a forward move from `self`. Equal phases are not
-    /// forward: a repeated receipt has nothing to add, and rejecting it keeps
-    /// the transition idempotent rather than merely harmless.
-    pub(crate) fn precedes(self, next: Phase) -> bool {
-        self.rank() < next.rank()
-    }
 }
 
 /// The durable record. One file, rewritten atomically at each transition.
@@ -127,6 +109,116 @@ impl Record {
             pid: None,
             unique_name: None,
             bus_id: None,
+        }
+    }
+}
+
+/// The record state a transition requires *before* it writes anything.
+///
+/// Every mutation names the state its caller decided from and is refused if the
+/// record has moved since. The comparison is on `(token, generation)` plus
+/// optionally the phase; pid, owner identity, and tier are payload a transition
+/// records rather than depends on.
+///
+/// `phase: Some(_)` is what makes the receipt chain exact. A receipt is written
+/// with the phase it must follow — `owned` expects `started` — so a skip is an
+/// ordinary mismatch, and there is no separate ordering rule that could drift
+/// out of step with the phase list.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Expected<'a> {
+    token: &'a str,
+    generation: u32,
+    /// `None` matches this attempt at any phase.
+    phase: Option<Phase>,
+}
+
+impl<'a> Expected<'a> {
+    /// Exactly the record the caller has in hand, phase included. What a
+    /// decision taken from an earlier read must prove is still current.
+    pub(crate) fn of(record: &'a Record) -> Self {
+        Expected {
+            token: &record.token,
+            generation: record.generation,
+            phase: Some(record.phase),
+        }
+    }
+
+    /// This attempt at exactly `phase`. Used by receipts, which name the phase
+    /// they follow rather than holding the record that carries it.
+    pub(crate) fn after(token: &'a str, generation: u32, phase: Phase) -> Self {
+        Expected {
+            token,
+            generation,
+            phase: Some(phase),
+        }
+    }
+
+    /// This attempt wherever the chain has reached.
+    ///
+    /// For a live process writing about its own episode: it is the only writer
+    /// of that episode's receipts, so any phase of it is a legitimate source,
+    /// and what must still be caught — a reset, or a newer episode — changes the
+    /// token or clears the record either way.
+    pub(crate) fn attempt(token: &'a str, generation: u32) -> Self {
+        Expected {
+            token,
+            generation,
+            phase: None,
+        }
+    }
+
+    fn holds(&self, current: Option<&Record>) -> bool {
+        current.is_some_and(|current| {
+            current.token == self.token
+                && current.generation == self.generation
+                && self.phase.is_none_or(|phase| current.phase == phase)
+        })
+    }
+}
+
+/// What a transition makes durable.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum Next<'a> {
+    /// Replace the record with this one.
+    Record(&'a Record),
+    /// Delete the record and every claim. `--reset-rendering-mode`, and the
+    /// discard of a record written by another app version.
+    Cleared,
+}
+
+/// Why a transition did not happen.
+///
+/// Both variants carry a description rather than the record involved: every
+/// caller either reports the refusal or re-decides from a fresh read, and none
+/// inspects the record that was found.
+#[derive(Debug)]
+pub(crate) enum Refused {
+    /// The record is no longer the one the caller decided from, so whatever the
+    /// caller intended rests on state that no longer exists. The caller must
+    /// reconcile again rather than proceed.
+    Stale(String),
+    /// The record could not be made durable.
+    NotDurable(String),
+}
+
+impl Refused {
+    /// Describe what was found where the caller expected its own source.
+    fn stale(found: Option<&Record>) -> Self {
+        Refused::Stale(match found {
+            Some(found) => format!(
+                "the episode record is now {:?} (token={} gen={})",
+                found.phase, found.token, found.generation
+            ),
+            None => "the episode record was cleared".to_string(),
+        })
+    }
+}
+
+impl std::fmt::Display for Refused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Refused::Stale(detail) => f.write_str(detail),
+            Refused::NotDurable(error) => write!(f, "the record is not durable: {error}"),
         }
     }
 }
@@ -215,13 +307,42 @@ impl Store {
         serde_json::from_str(&text).ok()
     }
 
-    /// Atomically replace the record. Durability matters here: a torn record
-    /// after a crash would be indistinguishable from a corrupt one and would
-    /// silently restart the ladder.
+    /// Atomically replace the record, or delete it, if the record still matches
+    /// `expected` — `None` meaning it must still be absent.
     ///
-    /// Requires a `Transaction`, so the read this write is based on and the
-    /// write itself are always inside one critical section.
-    pub(crate) fn write(&self, _tx: &Transaction, record: &Record) -> Result<(), String> {
+    /// This is the only way anything durable changes. The re-read happens under
+    /// the caller's `Transaction`, so between the comparison and the write no
+    /// other process can intervene — which is exactly what a caller that decided
+    /// from an earlier read needs, since its decision may have been overtaken by
+    /// a reset or a newer episode in the meantime.
+    ///
+    /// Durability matters for the write: a torn record after a crash would be
+    /// indistinguishable from a corrupt one and would silently restart the
+    /// ladder.
+    pub(crate) fn transition(
+        &self,
+        _tx: &Transaction,
+        expected: Option<Expected<'_>>,
+        next: Next<'_>,
+    ) -> Result<(), Refused> {
+        let current = self.read();
+        let holds = match expected {
+            Some(expected) => expected.holds(current.as_ref()),
+            None => current.is_none(),
+        };
+        if !holds {
+            return Err(Refused::stale(current.as_ref()));
+        }
+        match next {
+            Next::Cleared => {
+                let _ = std::fs::remove_dir_all(&self.dir);
+                Ok(())
+            }
+            Next::Record(record) => self.write(record).map_err(Refused::NotDurable),
+        }
+    }
+
+    fn write(&self, record: &Record) -> Result<(), String> {
         use atomic_write_file::AtomicWriteFile;
 
         std::fs::create_dir_all(&self.dir)
@@ -236,12 +357,10 @@ impl Store {
             .map_err(|e| format!("commit {}: {e}", path.display()))
     }
 
-    /// Delete the record and every claim. Used by `--reset-rendering-mode` and
-    /// when a record cannot be parsed. Returns whether anything was there.
-    pub(crate) fn clear(&self, _tx: &Transaction) -> bool {
-        let existed = self.dir.exists();
-        let _ = std::fs::remove_dir_all(&self.dir);
-        existed
+    /// Whether any renderer state exists, for `--reset-rendering-mode`'s report
+    /// of what it cleared. Called under the same transaction as the clear.
+    pub(crate) fn exists(&self, _tx: &Transaction) -> bool {
+        self.dir.exists()
     }
 
     /// Drop the claim files of superseded episodes, keeping every claim that
@@ -318,10 +437,16 @@ impl Store {
     }
 
     /// Write a record outside a transition, for tests that need a starting
-    /// state. Takes and drops its own lock.
+    /// state. Takes and drops its own lock, and expects whatever is there.
     #[cfg(test)]
     pub(crate) fn seed_record(&self, record: &Record) {
         let tx = self.lock().expect("lock");
-        self.write(&tx, record).expect("write");
+        let current = self.read();
+        self.transition(
+            &tx,
+            current.as_ref().map(Expected::of),
+            Next::Record(record),
+        )
+        .expect("seed");
     }
 }

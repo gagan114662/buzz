@@ -68,7 +68,10 @@ fn test_a_stale_generation_cannot_overwrite_a_record_prepared_while_it_waited() 
 
     // The retry becomes durable while the stale child is parked.
     let prepared = record(Phase::Prepared, 1, 1);
-    store.write(&tx, &prepared).expect("prepare generation 1");
+    let current = store.read().expect("the generation-0 record");
+    store
+        .transition(&tx, Some(Expected::of(&current)), Next::Record(&prepared))
+        .expect("prepare generation 1");
     drop(tx);
 
     let claimed = stale.join().expect("stale child");
@@ -143,8 +146,9 @@ fn test_a_confirmation_racing_a_handoff_does_not_resurrect_its_episode() {
         2,
         VERSION,
     );
+    let current = store.read().expect("the owned record");
     store
-        .write(&tx, &handed_off)
+        .transition(&tx, Some(Expected::of(&current)), Next::Record(&handed_off))
         .expect("prepare the next rung");
     drop(tx);
 
@@ -285,53 +289,236 @@ fn test_a_rollback_does_not_erase_an_episode_prepared_after_it() {
     assert_eq!(current.phase, Phase::Prepared);
 }
 
-// ── Receipt currency and forward-only phases ────────────────────────────────
+// ── Stale boot decisions ────────────────────────────────────────────────────
+//
+// Deciding and writing are two steps with a D-Bus round trip between them, so
+// the record can move in between. These prove the write is refused rather than
+// applied, and that the launch then re-decides from what is actually there.
+
+/// A refusing launch edge that clears the state dir first, standing in for
+/// another process running `--reset-rendering-mode` inside the window between
+/// this launch's classification and its prepared write.
+///
+/// Refusing after the clear is what keeps the test honest: the parent reaches
+/// its rollback, so a rollback that ignored the reset would restore the record
+/// just as surely as a stale prepare would.
+fn reset_then_refuse(
+    _name: &str,
+    _binary: &std::path::Path,
+    _args: &[OsString],
+    _package: Package,
+    _tier: &'static Tier,
+    _tag: &Tag,
+) -> Result<u32, Refusal> {
+    let path = RACING_STORE.lock().expect("path").clone().expect("path");
+    let store = Store::new(&path);
+    let tx = store.lock().expect("lock");
+    let current = store.read();
+    store
+        .transition(&tx, current.as_ref().map(Expected::of), Next::Cleared)
+        .expect("reset");
+    Err(Refusal::SpawnFailed("no child".to_string()))
+}
 
 #[test]
-fn test_a_receipt_requires_a_current_episode_and_a_forward_phase() {
-    let current = record(Phase::Owned, 0, 1);
-    let episode = Episode {
+fn test_a_reset_is_not_undone_by_a_launch_that_decided_before_it() {
+    // The race Thufir named: A reads a failed tier and decides to advance, B
+    // resets and reports success, then A writes its pre-reset decision. If A's
+    // write lands, the user who just cleared their renderer state finds a
+    // prepared episode waiting for them anyway.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let store = Store::new(dir.path());
+    store.seed_record(&record(Phase::Confirmed, 0, 2));
+    *RACING_STORE.lock().expect("path") = Some(dir.path().to_path_buf());
+    let env = env_from(&[]);
+
+    let boot = reconcile(
+        Ok(dir.path().to_path_buf()),
+        IDENTIFIER,
+        VERSION,
+        Vec::new(),
+        &env,
+        reset_then_refuse,
+    );
+
+    // The app still starts — a reset is not a reason to refuse to launch — but
+    // at the baseline it was launched as, with nothing persisted.
+    let Boot::Run(session) = boot else {
+        panic!("a cleared record still starts the app");
+    };
+    assert_eq!(session.profile_name(), "full-gpu");
+    assert_eq!(
+        store.read(),
+        None,
+        "the reset must survive the decision taken before it"
+    );
+}
+
+#[test]
+fn test_a_version_mismatch_discard_does_not_delete_a_newer_episode() {
+    // The mirror race: this launch classifies a record from another app version
+    // and decides to discard it, but by the time it writes, a current-version
+    // launch has prepared an episode whose child is about to claim it. A blind
+    // clear would turn that handoff into an untracked launch.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let store = Store::new(dir.path());
+    let stale_version = Record::new(Phase::Confirmed, TOKEN, 0, "cpu-raster", 2, "0.4.25");
+    store.seed_record(&stale_version);
+
+    // Classify the old record exactly as `reconcile` does, then let the newer
+    // episode land before the discard is attempted.
+    let classified = store.read().expect("the other version's record");
+    let newer = Record::new(
+        Phase::Prepared,
+        "a-newer-token",
+        0,
+        "shm-transport",
+        1,
+        VERSION,
+    );
+    store.seed_record(&newer);
+
+    let tx = store.lock().expect("lock");
+    let refused = store
+        .transition(&tx, Some(Expected::of(&classified)), Next::Cleared)
+        .is_err();
+    drop(tx);
+
+    assert!(refused, "the discard must be refused, not applied");
+    assert_eq!(
+        store.read().as_ref(),
+        Some(&newer),
+        "the newer episode must survive a delayed discard"
+    );
+}
+
+// ── The exact receipt chain ─────────────────────────────────────────────────
+//
+// A receipt names the phase it follows, so the chain is checked by the same
+// comparison that rejects a superseded episode. These drive the real store
+// rather than a predicate, which is what makes them evidence that nothing lands
+// on disk.
+
+/// Attempt a receipt exactly as `Session::note` does — expecting this episode at
+/// the phase `next` must follow — and report whether it landed.
+fn receipt(store: &Store, episode: &Episode, next: Phase) -> bool {
+    let follows = predecessor_of(next).expect("a receipt phase has a predecessor");
+    let mut written = record(next, episode.generation, 1);
+    written.pid = Some(std::process::id());
+    let tx = store.lock().expect("lock");
+    store
+        .transition(
+            &tx,
+            Some(Expected::after(&episode.token, episode.generation, follows)),
+            Next::Record(&written),
+        )
+        .is_ok()
+}
+
+fn episode_zero() -> Episode {
+    Episode {
         token: TOKEN.to_string(),
         generation: 0,
-    };
+    }
+}
 
-    assert!(may_advance(Some(&current), &episode, Phase::Confirmed));
-    // Backwards and sideways are both rejected: a repeated callback has nothing
-    // to add, and an out-of-order one must not undo a later phase.
-    assert!(!may_advance(Some(&current), &episode, Phase::Owned));
-    assert!(!may_advance(Some(&current), &episode, Phase::Started));
-    // Another token's or generation's receipt is never current here.
-    assert!(!may_advance(
-        Some(&current),
-        &Episode {
+#[test]
+fn test_the_receipt_chain_admits_only_the_exact_next_phase() {
+    let (_dir, store) = store();
+    store.seed_record(&record(Phase::Started, 0, 1));
+    let episode = episode_zero();
+
+    // Backwards and sideways: a repeated callback has nothing to add, and an
+    // out-of-order one must not undo a later phase.
+    assert!(!receipt(&store, &episode, Phase::Started));
+    // The one legal move from `started`.
+    assert!(receipt(&store, &episode, Phase::Owned));
+    assert_eq!(store.read().expect("record").phase, Phase::Owned);
+    assert!(receipt(&store, &episode, Phase::Confirmed));
+    assert_eq!(store.read().expect("record").phase, Phase::Confirmed);
+}
+
+#[test]
+fn test_a_receipt_that_skips_its_predecessor_is_rejected() {
+    // Rank-based "forward" accepted these. The chain is exact: a `confirmed`
+    // that skips `owned` would persist a crash-free startup fact for a tier that
+    // never recorded holding the name, and the next launch would reuse it.
+    for (from, skipped) in [
+        (Phase::Prepared, Phase::Owned),
+        (Phase::Prepared, Phase::Confirmed),
+        (Phase::Started, Phase::Confirmed),
+    ] {
+        let (_dir, store) = store();
+        let before = record(from, 0, 1);
+        store.seed_record(&before);
+
+        assert!(
+            !receipt(&store, &episode_zero(), skipped),
+            "{skipped:?} must not be writable over {from:?}"
+        );
+        assert_eq!(
+            store.read().as_ref(),
+            Some(&before),
+            "a rejected receipt must leave the record untouched"
+        );
+    }
+}
+
+#[test]
+fn test_a_receipt_for_a_superseded_episode_is_rejected() {
+    let (_dir, store) = store();
+    store.seed_record(&record(Phase::Started, 0, 1));
+
+    // Another token, and another generation of this token: neither is current.
+    for episode in [
+        Episode {
             token: "another-token".to_string(),
-            generation: 0
+            generation: 0,
         },
-        Phase::Confirmed
-    ));
-    assert!(!may_advance(
-        Some(&current),
-        &Episode {
+        Episode {
             token: TOKEN.to_string(),
-            generation: 1
+            generation: 1,
         },
-        Phase::Confirmed
-    ));
-    // A cleared record is not something a receipt may recreate: the record a
-    // receipt belongs to is written by the parent before the child exists.
-    assert!(!may_advance(None, &episode, Phase::Confirmed));
+    ] {
+        assert!(!receipt(&store, &episode, Phase::Owned));
+    }
+    assert_eq!(store.read().expect("record").phase, Phase::Started);
+}
+
+#[test]
+fn test_a_receipt_does_not_recreate_a_cleared_record() {
+    // The record a receipt belongs to is written by the parent before the child
+    // exists, so its absence means the episode was cleared — not that a receipt
+    // should bring it back.
+    let (_dir, store) = store();
+    assert!(!receipt(&store, &episode_zero(), Phase::Owned));
+    assert_eq!(store.read(), None);
 }
 
 #[test]
 fn test_the_exhausted_phase_is_terminal_against_a_late_receipt() {
-    // `Exhausted` outranks every other phase, so the attempt that exhausted the
-    // ladder cannot reopen it with a receipt that arrives afterwards.
+    // `exhausted` is written from any phase of its own attempt, so nothing in
+    // the chain leads out of it: every receipt names a predecessor, and
+    // `exhausted` is not one.
+    let (_dir, store) = store();
     let exhausted = record(Phase::Exhausted, 0, 3);
-    let episode = Episode {
-        token: TOKEN.to_string(),
-        generation: 0,
-    };
+    store.seed_record(&exhausted);
+    let episode = episode_zero();
+
     for phase in [Phase::Started, Phase::Owned, Phase::Confirmed] {
-        assert!(!may_advance(Some(&exhausted), &episode, phase));
+        assert!(!receipt(&store, &episode, phase));
     }
+    assert_eq!(store.read().as_ref(), Some(&exhausted));
+}
+
+#[test]
+fn test_only_prepared_and_exhausted_have_no_predecessor() {
+    // The two phases no receipt writes: `prepared` is written by a parent about
+    // an attempt that does not exist yet, and `exhausted` is validated against
+    // the whole attempt instead of one position.
+    assert_eq!(predecessor_of(Phase::Started), Some(Phase::Prepared));
+    assert_eq!(predecessor_of(Phase::Owned), Some(Phase::Started));
+    assert_eq!(predecessor_of(Phase::Confirmed), Some(Phase::Owned));
+    assert_eq!(predecessor_of(Phase::Prepared), None);
+    assert_eq!(predecessor_of(Phase::Exhausted), None);
 }

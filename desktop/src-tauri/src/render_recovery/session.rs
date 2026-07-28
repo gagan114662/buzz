@@ -6,6 +6,8 @@
 //! that. What it returns is either a `Session`, which the rest of the process
 //! uses to react to a crash, or an instruction to exit.
 
+mod handoff;
+
 use std::ffi::OsString;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -16,7 +18,7 @@ use super::dbus::{self, Observation};
 use super::episode::{self, Advance, Claimed, Episode, Termination};
 use super::launcher::{self, Handoff, Refusal, Tag};
 use super::profiles::{self, Env, Package, Tier};
-use super::state::{Phase, Record, Store, Transaction};
+use super::state::{Expected, Next, Phase, Record, Refused, Store};
 use super::LOG;
 
 /// Why the ladder is not running this launch. In every case the app starts
@@ -121,6 +123,64 @@ impl Release<'_> {
         }
     }
 }
+
+/// A durable write was refused because the record no longer matches the state
+/// its caller decided from — another process reset it, or a newer episode
+/// superseded it.
+///
+/// Nothing was released and nothing was spawned when this comes back: the
+/// prepared write is the first thing a handoff does, before the release and the
+/// spawn. Boot answers it by deciding again from the new state; the live crash
+/// path answers it by standing down, since a process whose episode has been
+/// superseded is not the one that should be laddering.
+///
+/// Carries the description rather than the record it found, because describing
+/// what changed is all any caller does with it.
+struct Stale(String);
+
+impl std::fmt::Display for Stale {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// Which state a durable write is allowed to replace.
+///
+/// The two callers differ in kind, not merely in value. Boot reconciliation acts
+/// on a record it read *earlier* and must prove that exact record is still
+/// current. The live crash path acts on a crash that just happened, and its
+/// source is its own episode wherever the chain has reached — it holds no
+/// earlier snapshot to be stale about. Naming the distinction is what stops a
+/// classified snapshot from silently standing in for a fresh read.
+#[derive(Clone, Copy)]
+enum Source<'a> {
+    /// Exactly this record, or the write is refused. `None` expects no record.
+    Classified(Option<&'a Record>),
+    /// This process's own episode, at the phase a `prepared` write must follow.
+    OwnEpisode,
+}
+
+/// What one reconciliation round settled on, once any durable write it needed
+/// has landed.
+///
+/// Carries no `Session`: the loop holds that by `&mut`, so a round that has to
+/// be retaken does not have to move an owned value out and back.
+enum Settled {
+    /// Run in this process, with whatever tier and freeze the round selected.
+    RunHere,
+    /// A child carrying the selected tier is Buzz now; this process exits.
+    HandedOff,
+    /// Exit before Tauri with this diagnostic.
+    Fatal(String),
+}
+
+/// How many times boot reconciliation re-decides before standing down.
+///
+/// This is not a spin: a refusal only happens when another process durably
+/// changed the record, so every round is somebody else's progress. Standing
+/// down runs the launched profile untracked — the one outcome that is always
+/// safe, because it writes nothing and still starts the app.
+const RECONCILE_ATTEMPTS: usize = 3;
 
 /// What a live app must do about a web-process termination.
 pub(crate) enum CrashResponse {
@@ -254,8 +314,8 @@ impl Session {
     /// `--reset-rendering-mode`: delete the persisted tier and episode state,
     /// say what was cleared, and exit without launching.
     fn reset(self) -> Boot {
-        let cleared = match self.store.lock() {
-            Ok(tx) => self.store.clear(&tx),
+        let tx = match self.store.lock() {
+            Ok(tx) => tx,
             Err(error) => {
                 // Another process is mid-transition. Clearing without the lock
                 // could delete a record a live child is about to claim, so this
@@ -263,6 +323,17 @@ impl Session {
                 return Boot::Fatal(format!("could not clear renderer state: {error}"));
             }
         };
+        // Reading the source inside the transaction that clears it is what makes
+        // reset an ordering boundary: it cannot be stale, and any decision taken
+        // from the state it deletes is refused when that decision tries to write.
+        let cleared = self.store.exists(&tx);
+        let source = self.store.read();
+        if let Err(error) =
+            self.store
+                .transition(&tx, source.as_ref().map(Expected::of), Next::Cleared)
+        {
+            return Boot::Fatal(format!("could not clear renderer state: {error}"));
+        }
         println!(
             "{}",
             match cleared {
@@ -273,11 +344,19 @@ impl Session {
         Boot::Reset
     }
 
-    /// Untagged launch: classify the record, then either run the selected tier
-    /// here or hand off to a child that can.
+    /// Untagged launch: decide from the durable record, then either run the
+    /// selected tier here or hand off to a child that can.
+    ///
+    /// Deciding and acting are two steps with a D-Bus round trip between them,
+    /// so the record can move in between — another launch's reset, or a newer
+    /// episode. Every write therefore names the record it was decided from and
+    /// is refused if that record is gone, and a refusal re-decides from what is
+    /// there now rather than proceeding on a decision about a state that no
+    /// longer exists.
     fn select_tier(mut self, safe_rendering: bool) -> Boot {
         // `--safe-rendering` is a manual override for this launch only: the
-        // terminal tier, no episode, nothing persisted.
+        // terminal tier, no episode, nothing persisted. It reads no record, so
+        // there is nothing for it to be stale about.
         if safe_rendering {
             self.tier = self.package.terminal_tier();
             self.frozen = true;
@@ -286,11 +365,54 @@ impl Session {
                 cli::SAFE_RENDERING,
                 self.profile_name()
             );
-            return self.run_selected_tier();
+            return match self.hand_off_or_run(None, self.tier, None) {
+                Ok(Settled::RunHere) => Boot::Run(Arc::new(self)),
+                Ok(Settled::HandedOff) => Boot::HandedOff,
+                Ok(Settled::Fatal(diagnostic)) => Boot::Fatal(diagnostic),
+                // A forced launch prepares no record, so it has nothing to be
+                // stale about; `hand_off_or_run` cannot refuse it this way.
+                Err(stale) => Boot::Fatal(format!("renderer state changed unexpectedly: {stale}")),
+            };
         }
 
+        for attempt in 1..=RECONCILE_ATTEMPTS {
+            match self.reconcile_once() {
+                Ok(Settled::RunHere) => return Boot::Run(Arc::new(self)),
+                Ok(Settled::HandedOff) => return Boot::HandedOff,
+                Ok(Settled::Fatal(diagnostic)) => return Boot::Fatal(diagnostic),
+                Err(stale) => {
+                    eprintln!(
+                        "{LOG}: renderer state changed under this launch ({stale}); \
+                         re-reading it (attempt {attempt} of {RECONCILE_ATTEMPTS})"
+                    );
+                    // Nothing was released or spawned — a refused write is the
+                    // first thing a handoff does — so the next round starts from
+                    // the tier this process was actually launched as.
+                    self.tier = 0;
+                    self.frozen = false;
+                }
+            }
+        }
+        // Another process has out-raced this one repeatedly. Running the
+        // launched profile untracked is the safe stand-down: it writes nothing,
+        // so it cannot corrupt whatever that process is doing, and the app still
+        // starts.
+        eprintln!(
+            "{LOG}: renderer state kept changing; running the launched profile \
+             without tracking it"
+        );
+        self.tier = 0;
+        self.frozen = true;
+        Boot::Run(Arc::new(self))
+    }
+
+    /// One decide-then-act round. `Err` means the record moved before the write
+    /// this decision called for could land, so the decision must be retaken.
+    fn reconcile_once(&mut self) -> Result<Settled, Stale> {
         let Some(record) = self.store.read() else {
-            return self.run_selected_tier();
+            // No record to be superseded, and a handoff from here prepares only a
+            // freshly minted episode, which expects exactly this absence.
+            return self.run_here_or_hand_off(None);
         };
         let decision = classify::decide(
             &record,
@@ -303,25 +425,27 @@ impl Session {
             "{LOG}: found {:?} record (token={} gen={} tier={} profile={}) → {decision:?}",
             record.phase, record.token, record.generation, record.tier, record.profile
         );
+        let source = Some(&record);
 
         match decision {
             // Another instance owns the app. Run on as an ordinary duplicate
             // and let the single-instance plugin forward argv and exit us.
-            Decision::Defer(_) => Boot::Run(Arc::new(self)),
+            // Writes nothing, so nothing can be stale.
+            Decision::Defer(_) => Ok(Settled::RunHere),
             Decision::DiscardAndBaseline { .. } => {
-                if let Ok(tx) = self.store.lock() {
-                    self.store.clear(&tx);
-                }
-                self.run_selected_tier()
+                self.clear_discarded(&record)?;
+                // The record this decision was about is gone and the baseline is
+                // what is left, so a fresh episode expects no record at all.
+                self.run_here_or_hand_off(None)
             }
             // The persisted "last crash-free startup profile" fact.
             Decision::ReuseProfile { tier } => {
                 self.tier = tier;
-                self.run_selected_tier()
+                self.run_here_or_hand_off(source)
             }
             // No profile survived. Stop rather than relaunch: this process is
             // the baseline environment, and the user's way to the safest tier
-            // is the flag, not another fork.
+            // is the flag, not another fork. Writes nothing.
             Decision::StopExhausted { tier } => {
                 self.frozen = true;
                 eprintln!(
@@ -330,45 +454,70 @@ impl Session {
                     self.package.label(),
                     cli::SAFE_RENDERING
                 );
-                Boot::Run(Arc::new(self))
+                Ok(Settled::RunHere)
             }
             // An attempt that never produced a receipt: re-run the same tier
             // under the next generation.
             Decision::RetrySameTier { tier, .. } => {
                 self.tier = tier;
-                self.hand_off_or_run(Some(episode::retry_of(&record)), tier)
+                self.hand_off_or_run(Some(episode::retry_of(&record)), tier, source)
             }
-            Decision::AdvanceOrStop { tier, .. } => self.step_down(tier),
+            Decision::AdvanceOrStop { tier, .. } => self.step_down(tier, &record),
+        }
+    }
+
+    /// Discard a record this launch cannot use — a different app version's.
+    ///
+    /// Named source, so a delayed version-mismatch decision cannot delete an
+    /// episode that a newer launch prepared while this one was classifying.
+    fn clear_discarded(&self, source: &Record) -> Result<(), Stale> {
+        let tx = self
+            .store
+            .lock()
+            .map_err(|error| Stale(format!("the state lock was unavailable: {error}")))?;
+        match self
+            .store
+            .transition(&tx, Some(Expected::of(source)), Next::Cleared)
+        {
+            Ok(()) => Ok(()),
+            Err(error @ Refused::Stale(_)) => Err(Stale(error.to_string())),
+            Err(error) => {
+                eprintln!("{LOG}: could not discard the stale record — {error}");
+                Ok(())
+            }
         }
     }
 
     /// Continue here when this process already carries the selected tier's
     /// environment, otherwise hand off to a child that carries it exactly.
-    fn run_selected_tier(self) -> Boot {
+    fn run_here_or_hand_off(&mut self, source: Option<&Record>) -> Result<Settled, Stale> {
         if self.tier == 0 {
             // Tier 0 sets nothing, and the opt-out check above proved no owned
             // variable is present — this process already *is* tier 0.
-            return Boot::Run(Arc::new(self));
+            return Ok(Settled::RunHere);
         }
         // A frozen launch is a manual override, so it runs the tier without
         // owning an episode: no record, no receipt, no advance.
         let episode = (!self.frozen).then(episode::fresh);
         let tier = self.tier;
-        self.hand_off_or_run(episode, tier)
+        self.hand_off_or_run(episode, tier, source)
     }
 
     /// Move one tier down for a failed attempt, or stop at the terminal tier.
-    fn step_down(mut self, failed: usize) -> Boot {
+    fn step_down(&mut self, failed: usize, source: &Record) -> Result<Settled, Stale> {
         match episode::advance(self.package, failed) {
             Advance::Tier(next) => {
                 self.tier = next;
-                self.hand_off_or_run(Some(episode::fresh()), next)
+                self.hand_off_or_run(Some(episode::fresh()), next, Some(source))
             }
             Advance::Exhausted => {
                 self.tier = failed;
                 self.frozen = true;
-                self.note_exhausted();
-                Boot::Run(Arc::new(self))
+                // Named source: an `exhausted` write is terminal, so writing it
+                // over a record that has since been reset or superseded would
+                // strand the ladder on a decision about state that is gone.
+                self.note_exhausted(Source::Classified(Some(source)))?;
+                Ok(Settled::RunHere)
             }
         }
     }
@@ -450,14 +599,14 @@ impl Session {
 
     /// Write a phase receipt for the episode this process owns.
     ///
-    /// Two conditions gate the write, both under the transaction lock. The
-    /// identity check (`episode::may_advance`) rejects a receipt for an episode
-    /// that is no longer current: `note_confirmed` runs from a timer thread and
-    /// can be racing a crash handoff that has already prepared the next token,
-    /// and without the check it would overwrite that token with the superseded
-    /// episode's `confirmed`. The phase check rejects a receipt that does not
-    /// move the record forward, so a repeated or out-of-order callback cannot
-    /// walk it backwards.
+    /// The transition names both the episode and the phase the receipt follows,
+    /// which is two rejections in one. Identity: `note_confirmed` runs from a
+    /// timer thread and can be racing a crash handoff that already prepared the
+    /// next token, and without the check it would overwrite that token with the
+    /// superseded episode's `confirmed`. Order: the chain is exact, so a receipt
+    /// that skips its predecessor — a `confirmed` after a failed `owned` write,
+    /// or an out-of-order callback — is refused rather than accepted as
+    /// "forward".
     ///
     /// The receipt is bound to the bus id as well as the unique name: a unique
     /// name like `:1.4` only identifies a connection on the bus that issued it,
@@ -467,14 +616,15 @@ impl Session {
         let Some(episode) = &self.episode else {
             return;
         };
+        let Some(follows) = episode::predecessor_of(phase) else {
+            // Only `prepared` and `exhausted` have no predecessor, and neither is
+            // written through here.
+            return;
+        };
         let Ok(tx) = self.store.lock() else {
             eprintln!("{LOG}: skipping the {phase:?} receipt — the state lock was unavailable");
             return;
         };
-        if !episode::may_advance(self.store.read().as_ref(), episode, phase) {
-            eprintln!("{LOG}: skipping the {phase:?} receipt — this episode is no longer current");
-            return;
-        }
 
         let mut record = self.record(phase, episode);
         record.pid = Some(std::process::id());
@@ -488,7 +638,13 @@ impl Session {
             // identity as uncorrelatable rather than as ours.
             _ => eprintln!("{LOG}: writing {phase:?} without an owner identity"),
         }
-        self.write(&tx, &record);
+        let expected = Expected::after(&episode.token, episode.generation, follows);
+        if let Err(error) = self
+            .store
+            .transition(&tx, Some(expected), Next::Record(&record))
+        {
+            eprintln!("{LOG}: skipping the {phase:?} receipt — {error}");
+        }
     }
 
     /// React to a web-process termination.
@@ -524,12 +680,31 @@ impl Session {
 
         match episode::advance(self.package, self.tier) {
             Advance::Exhausted => {
-                self.note_exhausted();
+                // A stale terminal write means this process's episode was
+                // superseded while it ran. Nothing to do: the process that
+                // superseded it owns the ladder now.
+                if let Err(stale) = self.note_exhausted(Source::OwnEpisode) {
+                    eprintln!("{LOG}: not recording the exhausted ladder — {stale}");
+                }
                 CrashResponse::Continue
             }
             Advance::Tier(next) => {
                 let release = Release::SingleInstanceName(destroy_single_instance);
-                match self.hand_off(episode::fresh(), next, &release) {
+                let handoff =
+                    match self.hand_off(episode::fresh(), next, Source::OwnEpisode, &release) {
+                        Ok(handoff) => handoff,
+                        // Refused before anything was released or spawned, so this
+                        // process still owns its name. Another process superseded
+                        // this episode, which means it is already driving the
+                        // ladder — advancing here too would fork it.
+                        Err(stale) => {
+                            eprintln!(
+                            "{LOG}: not advancing the ladder — {stale}; another launch owns it now"
+                        );
+                            return CrashResponse::Continue;
+                        }
+                    };
+                match handoff {
                     Handoff::Launched => CrashResponse::HandedOff,
                     // Nothing was released, so this process is still the app.
                     Handoff::RefusedBeforeRelease(refusal) => {
@@ -552,187 +727,58 @@ impl Session {
         }
     }
 
-    /// Hand off to a child at `tier`, or run on here if the handoff is refused.
-    /// Only reached before Tauri exists, so nothing is held and every refusal
-    /// leaves this process exactly as it was launched.
-    fn hand_off_or_run(mut self, episode: Option<Episode>, tier: usize) -> Boot {
-        let handed = match episode {
-            Some(episode) => self.hand_off(episode, tier, &Release::NothingHeld),
-            None => self.force(tier),
-        };
-        match handed {
-            Handoff::Launched => Boot::HandedOff,
-            Handoff::RefusedBeforeRelease(refusal) => {
-                eprintln!("{LOG}: staying at the launched profile — {refusal}");
-                // The handoff did not happen, so this process is still the
-                // baseline it was launched as and must not claim otherwise.
-                self.tier = 0;
-                self.frozen = true;
-                Boot::Run(Arc::new(self))
-            }
-            // Unreachable by construction: `Release::NothingHeld` releases
-            // nothing, so there is no post-release side to land on. Handled as a
-            // refusal rather than a panic — if the invariant ever breaks, the
-            // safe reading of "we may have released something" is to not run.
-            Handoff::RefusedAfterRelease(refusal) => Boot::Fatal(format!(
-                "renderer handoff refused after an unexpected release: {refusal}"
-            )),
-        }
-    }
-
-    /// Prepare a record for `tier`, release the single-instance name, and spawn
-    /// a child carrying the tier's exact environment.
-    ///
-    /// The order is the whole mechanism. The record must be durable before the
-    /// child exists, because the child claims it as its first action and would
-    /// otherwise find nothing. The name must be released before the probe,
-    /// because a child that fails to take the name forwards its argv and exits
-    /// 0 — indistinguishable from a successful handoff.
-    fn hand_off(&self, episode: Episode, tier: usize, release: &Release<'_>) -> Handoff {
-        let rung = match self.rung(tier) {
-            Ok(rung) => rung,
-            Err(refusal) => return Handoff::RefusedBeforeRelease(refusal),
-        };
-        let tx = match self.store.lock() {
-            Ok(tx) => tx,
-            Err(error) => {
-                return Handoff::RefusedBeforeRelease(Refusal::StateNotDurable(error));
-            }
-        };
-        let previous = self.store.read();
-        let record = episode::prepare(&episode, self.package, tier, &self.version);
-        if let Err(error) = self.store.write(&tx, &record) {
-            return Handoff::RefusedBeforeRelease(Refusal::StateNotDurable(error));
-        }
-        if episode.generation == 0 {
-            // Only now that the new record is durable. Pruning first would, on a
-            // failed record write, leave the old record current with its claim
-            // evidence already gone — and an old child that had passed its
-            // record read could then re-create its claim and write a receipt
-            // over the record.
-            self.store.prune_claims(&tx, &episode.token);
-        }
-        // Released before the spawn: the record is durable and every check that
-        // does not need the name released has already run.
-        drop(tx);
-
-        let tag = Tag {
-            episode: Some(episode),
-            profile: rung.name.to_string(),
-        };
-        let handoff = self.spawn_child(rung, &tag, release);
-        if handoff.refused() {
-            // No child exists, so the prepared record describes an attempt that
-            // will never be claimed. Left in place it would spend the rung's one
-            // retry on a failure that was never about rendering.
-            self.roll_back(&record, previous);
-        }
-        handoff
-    }
-
-    /// Restore the record a refused handoff had already overwritten.
-    ///
-    /// Identity-checked, because the lock is dropped between the prepared write
-    /// and the spawn: by the time a refusal comes back, a concurrent launch may
-    /// have prepared its own episode, and a blind restore would erase a record
-    /// that a live child is about to claim — turning that child's handoff into
-    /// an untracked launch. Only the record this call itself wrote is rolled
-    /// back.
-    fn roll_back(&self, prepared: &Record, previous: Option<Record>) {
-        let Ok(tx) = self.store.lock() else {
-            eprintln!("{LOG}: could not roll back the prepared record — the state lock was busy");
-            return;
-        };
-        match self.store.read() {
-            Some(current)
-                if current.token == prepared.token && current.generation == prepared.generation => {
-            }
-            _ => {
-                eprintln!("{LOG}: not rolling back — another episode is current now");
-                return;
-            }
-        }
-        match previous {
-            Some(record) => self.write(&tx, &record),
-            None => {
-                self.store.clear(&tx);
-            }
-        }
-    }
-
-    /// Hand off to a child running `tier` with no episode: nothing is prepared,
-    /// nothing is claimed, and nothing is persisted. This is what a manual
-    /// override is — a launch the ladder runs but does not learn from.
-    fn force(&self, tier: usize) -> Handoff {
-        match self.rung(tier) {
-            Ok(rung) => {
-                let tag = Tag {
-                    episode: None,
-                    profile: rung.name.to_string(),
-                };
-                self.spawn_child(rung, &tag, &Release::NothingHeld)
-            }
-            Err(refusal) => Handoff::RefusedBeforeRelease(refusal),
-        }
-    }
-
-    /// The release boundary itself: every preflight that can fail runs *before*
-    /// `release.run()`, and everything after it is reported as a post-release
-    /// outcome.
-    ///
-    /// Resolving the binary belongs on this side of the line. Held as an
-    /// unresolved `Result` and passed onward it would surface only inside the
-    /// launcher — after the name was already gone — turning a plainly
-    /// recoverable "cannot find my own executable" into a stranded app.
-    fn spawn_child(&self, rung: &'static Tier, tag: &Tag, release: &Release<'_>) -> Handoff {
-        let binary = match tauri::process::current_binary(&tauri::Env::default()) {
-            Ok(binary) => binary,
-            Err(error) => {
-                return Handoff::RefusedBeforeRelease(Refusal::NoBinary(error.to_string()));
-            }
-        };
-
-        let released = release.run();
-        match (self.launch)(
-            &self.dbus_name,
-            &binary,
-            &self.args,
-            self.package,
-            rung,
-            tag,
-        ) {
-            Ok(pid) => {
-                eprintln!("{LOG}: handed off to {} as pid {pid}", rung.name);
-                Handoff::Launched
-            }
-            Err(refusal) => match released {
-                true => Handoff::RefusedAfterRelease(refusal),
-                false => Handoff::RefusedBeforeRelease(refusal),
-            },
-        }
-    }
-
     fn rung(&self, tier: usize) -> Result<&'static Tier, Refusal> {
         self.package
             .tier(tier)
             .ok_or_else(|| Refusal::NoTier(format!("{} has no tier {tier}", self.package.label())))
     }
 
+    /// The state a `prepared` write may replace.
+    ///
+    /// A classified source must still be exactly what was decided from. A live
+    /// crash path holds no earlier snapshot: it names its own episode, or — when
+    /// this process owns none, which is every tier-0 launch — whatever the
+    /// transaction just read, since there is no earlier decision to be stale
+    /// about.
+    fn expected<'a>(
+        &'a self,
+        source: Source<'a>,
+        current: Option<&'a Record>,
+    ) -> Option<Expected<'a>> {
+        match source {
+            Source::Classified(source) => source.map(Expected::of),
+            Source::OwnEpisode => match &self.episode {
+                Some(episode) => Some(Expected::attempt(&episode.token, episode.generation)),
+                None => current.map(Expected::of),
+            },
+        }
+    }
+
     /// Record that no profile survived, so later launches stop here instead of
     /// walking the whole ladder again on every start.
     ///
-    /// `Exhausted` outranks every other phase, so this write passes the forward
-    /// check from anywhere in the chain — which is what makes the terminal state
-    /// terminal even against a late receipt from the attempt that got here.
-    fn note_exhausted(&self) {
+    /// `Exhausted` is terminal, so it is the one write that most needs a named
+    /// source: stamping it over a record that has since been reset or superseded
+    /// would stop the ladder on the strength of a decision about state that no
+    /// longer exists.
+    fn note_exhausted(&self, source: Source<'_>) -> Result<(), Stale> {
         let episode = self.episode.clone().unwrap_or_else(episode::fresh);
         let Ok(tx) = self.store.lock() else {
             eprintln!("{LOG}: could not record the exhausted ladder — the state lock was busy");
-            return;
+            return Ok(());
         };
+        let current = self.store.read();
         let mut record = self.record(Phase::Exhausted, &episode);
         record.pid = Some(std::process::id());
-        self.write(&tx, &record);
+        match self.store.transition(
+            &tx,
+            self.expected(source, current.as_ref()),
+            Next::Record(&record),
+        ) {
+            Ok(()) => {}
+            Err(error @ Refused::Stale(_)) => return Err(Stale(error.to_string())),
+            Err(error) => eprintln!("{LOG}: could not record the exhausted ladder — {error}"),
+        }
         eprintln!(
             "{LOG}: ladder exhausted on {} at tier {} ({}); \
              relaunch with {} to force the safest profile",
@@ -741,6 +787,7 @@ impl Session {
             self.profile_name(),
             cli::SAFE_RENDERING
         );
+        Ok(())
     }
 
     fn record(&self, phase: Phase, episode: &Episode) -> Record {
@@ -752,12 +799,6 @@ impl Session {
             self.tier,
             &self.version,
         )
-    }
-
-    fn write(&self, tx: &Transaction, record: &Record) {
-        if let Err(error) = self.store.write(tx, record) {
-            eprintln!("{LOG}: failed to persist {:?}: {error}", record.phase);
-        }
     }
 }
 

@@ -6,7 +6,7 @@
 //! attempt cap ordinary unit tests.
 
 use super::profiles::Package;
-use super::state::{Claim, Phase, Record, Store, RETRY_GENERATION};
+use super::state::{Claim, Expected, Next, Phase, Record, Store, RETRY_GENERATION};
 
 /// Identity of one attempt. The token names the rung's attempt; the generation
 /// distinguishes the original from its sole retry.
@@ -98,10 +98,11 @@ pub(crate) enum Claimed {
 /// generation's receipt.
 ///
 /// The read, the claim, and the `started` write all happen inside one
-/// transaction. Split across three unsynchronized steps they were not enough: a
-/// child could read its own generation as current, be descheduled while another
-/// invocation durably prepared the next generation, then resume and stamp its
-/// stale `started` over the newer record.
+/// transaction, and the write names the exact record the read validated. Split
+/// across three unsynchronized steps they were not enough: a child could read
+/// its own generation as current, be descheduled while another invocation
+/// durably prepared the next generation, then resume and stamp its stale
+/// `started` over the newer record.
 pub(crate) fn claim(store: &Store, episode: &Episode) -> Claimed {
     let tx = match store.lock() {
         Ok(tx) => tx,
@@ -135,7 +136,7 @@ pub(crate) fn claim(store: &Store, episode: &Episode) -> Claimed {
     let mut started = record.clone();
     started.phase = Phase::Started;
     started.pid = Some(std::process::id());
-    if let Err(error) = store.write(&tx, &started) {
+    if let Err(error) = store.transition(&tx, Some(Expected::of(&record)), Next::Record(&started)) {
         // The claim is taken and cannot be given back, so this process is the
         // owner whether or not the receipt landed. Run on untracked: the record
         // still says `prepared`, and the next launch retries or advances it.
@@ -149,24 +150,21 @@ pub(crate) fn claim(store: &Store, episode: &Episode) -> Claimed {
     }
 }
 
-/// Whether `episode` may still write `next` over `current`.
+/// The phase a receipt for `next` requires the record to already be at.
 ///
-/// Two independent conditions, both necessary. The identity check rejects a
-/// receipt from an episode that is no longer current — a `confirmed` write
-/// racing the crash handoff that already prepared the next token would
-/// otherwise resurrect the superseded attempt. The phase check rejects a
-/// receipt that does not move the episode forward, so a duplicated or
-/// out-of-order callback cannot walk the record backwards.
-pub(crate) fn may_advance(current: Option<&Record>, episode: &Episode, next: Phase) -> bool {
-    let Some(current) = current else {
-        // Nothing on disk to advance. The record a receipt belongs to is
-        // written by the parent before the child exists, so its absence means
-        // this episode was cleared — not that a receipt should create it.
-        return false;
-    };
-    current.token == episode.token
-        && current.generation == episode.generation
-        && current.phase.precedes(next)
+/// The chain is exact rather than ordered: a receipt names the one state it
+/// follows, so a skip is a mismatch. `Prepared` has no predecessor — it is
+/// written by a parent about an attempt that does not exist yet — and
+/// `Exhausted` is validated as a terminal write against the whole attempt
+/// rather than one position, because the process recording it may or may not
+/// have landed its own `confirmed` receipt first.
+pub(crate) fn predecessor_of(next: Phase) -> Option<Phase> {
+    match next {
+        Phase::Started => Some(Phase::Prepared),
+        Phase::Owned => Some(Phase::Started),
+        Phase::Confirmed => Some(Phase::Owned),
+        Phase::Prepared | Phase::Exhausted => None,
+    }
 }
 
 /// The record a parent must make durable before spawning a child for `tier`.

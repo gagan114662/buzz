@@ -22,7 +22,7 @@
 //! exclusive claims), `episode` (attempt identity and the pure ladder rules),
 //! `dbus` (name observation), `classify` (record + observation → decision),
 //! `launcher` (the explicit relaunch), `cli` (flags), `session` (the live
-//! process), `wiring` (the Tauri plugin that carries it into the app).
+//! process, with `session::handoff` for prepare/release/spawn), `wiring` (the Tauri plugin that carries it into the app).
 
 pub(crate) mod classify;
 pub(crate) mod cli;

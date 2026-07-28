@@ -19,13 +19,13 @@ use super::classify::{decide, Decision, Ownership};
 use super::cli;
 use super::dbus::{Observation, Owner};
 use super::episode::{
-    advance, advances_ladder, claim, fresh, may_advance, prepare, retry_of, Advance, Claimed,
+    advance, advances_ladder, claim, fresh, predecessor_of, prepare, retry_of, Advance, Claimed,
     Episode, Termination, CRASH_ELIGIBILITY_WINDOW,
 };
 use super::launcher::{exact_env_command, Refusal, Tag, EPISODE, FORCED, GENERATION, PROFILE};
 use super::profiles::{owned_present, Package, Tier};
 use super::session::{reconcile, Boot, CrashResponse, Disabled};
-use super::state::{Phase, Record, Store};
+use super::state::{Expected, Next, Phase, Record, Store};
 
 const VERSION: &str = "0.4.26";
 const IDENTIFIER: &str = "xyz.block.buzz.app";
@@ -120,24 +120,109 @@ fn test_stale_generation_claim_does_not_block_the_retry() {
     assert_eq!(store.read().expect("record").phase, Phase::Started);
 }
 
+/// Environment variable that turns `claimer` from a no-op into a real claim
+/// attempt against the state dir it names. Set only by the test below, on the
+/// children it spawns.
+const CLAIMER_STATE_DIR: &str = "BUZZ_TEST_CLAIMER_STATE_DIR";
+
+/// Exit codes a claimer child reports its outcome with, since a claim result
+/// cannot be returned across a process boundary.
+const EXIT_OWNER: i32 = 10;
+const EXIT_SUPERSEDED: i32 = 11;
+
+/// One of the two racing children of `test_two_children_of_one_generation...`.
+///
+/// A separate `#[test]` because that is what makes it re-executable: the test
+/// binary can be asked for exactly this name, which yields a *real* process with
+/// its own pid — the only way to prove the receipt names the winner rather than
+/// merely that one receipt exists. Inert in an ordinary run, where the variable
+/// is unset.
+#[test]
+fn claimer() {
+    let Some(dir) = std::env::var_os(CLAIMER_STATE_DIR) else {
+        return;
+    };
+    let dir = std::path::PathBuf::from(dir);
+
+    // Rendezvous: each child announces itself, then waits for the other, so both
+    // are inside `claim` at once and the exclusive claim and the state lock are
+    // contended for real rather than in sequence.
+    let barrier = dir.join("barrier");
+    std::fs::create_dir_all(&barrier).expect("barrier dir");
+    std::fs::write(barrier.join(std::process::id().to_string()), b"").expect("arrive");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while std::fs::read_dir(&barrier).map(|e| e.count()).unwrap_or(0) < 2 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the sibling claimer never arrived"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+
+    let claimed = claim(
+        &Store::new(&dir),
+        &Episode {
+            token: TOKEN.to_string(),
+            generation: 1,
+        },
+    );
+    // `exit`, not a panic: the outcome has to survive as a status the parent can
+    // read, and the harness would turn a panic into a plain failure.
+    std::process::exit(match claimed {
+        Claimed::Owner { .. } => EXIT_OWNER,
+        Claimed::Superseded(_) => EXIT_SUPERSEDED,
+        Claimed::Untracked(reason) => panic!("neither child should be untracked: {reason}"),
+    });
+}
+
 #[test]
 fn test_two_children_of_one_generation_produce_exactly_one_receipt() {
-    let (_dir, store) = store();
+    let (dir, store) = store();
     store.seed_record(&record(Phase::Prepared, 1, 1));
-    let episode = Episode {
-        token: TOKEN.to_string(),
-        generation: 1,
-    };
 
-    let first = claim(&store, &episode);
-    let second = claim(&store, &episode);
+    // Two real processes, so the two claimers have different pids and the
+    // receipt can be checked against the identity of the one that won.
+    let children: Vec<std::process::Child> = (0..2)
+        .map(|_| {
+            std::process::Command::new(std::env::current_exe().expect("test binary"))
+                .args(["--exact", "render_recovery::tests::claimer", "--nocapture"])
+                .env(CLAIMER_STATE_DIR, dir.path())
+                .spawn()
+                .expect("spawn a claimer")
+        })
+        .collect();
 
-    assert!(matches!(first, Claimed::Owner { .. }));
-    assert!(matches!(second, Claimed::Superseded(_)));
+    let outcomes: Vec<(u32, Option<i32>)> = children
+        .into_iter()
+        .map(|mut child| {
+            let pid = child.id();
+            (pid, child.wait().expect("claimer exit").code())
+        })
+        .collect();
+
+    let winners: Vec<u32> = outcomes
+        .iter()
+        .filter(|(_, code)| *code == Some(EXIT_OWNER))
+        .map(|(pid, _)| *pid)
+        .collect();
+    let losers = outcomes
+        .iter()
+        .filter(|(_, code)| *code == Some(EXIT_SUPERSEDED))
+        .count();
+
+    assert_eq!(
+        winners.len(),
+        1,
+        "exactly one child may own the episode: {outcomes:?}"
+    );
+    assert_eq!(losers, 1, "the other must stand down: {outcomes:?}");
+    // One claim file, and the durable receipt names the process that took it.
+    // A loser that had written the receipt would leave the record pointing at a
+    // process that is not the app.
     assert_eq!(store.claim_count(), 1);
     let written = store.read().expect("record");
     assert_eq!(written.phase, Phase::Started);
-    assert_eq!(written.pid, Some(std::process::id()));
+    assert_eq!(written.pid, Some(winners[0]));
 }
 
 #[test]
