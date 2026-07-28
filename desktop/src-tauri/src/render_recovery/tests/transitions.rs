@@ -230,10 +230,15 @@ fn test_two_termination_callbacks_hand_off_exactly_once() {
     assert_eq!(store.claim_count(), 0);
 }
 
-/// App-data path for the rollback race below, so the refusing launch edge can
-/// write a competing record from inside the window the parent left open. A
-/// `static` for the same reason as `SPAWNS`: the launch edge captures nothing.
-static RACING_STORE: std::sync::Mutex<Option<std::path::PathBuf>> = std::sync::Mutex::new(None);
+/// Where a racing launch edge finds the store to act on.
+///
+/// The launch edge is a bare `fn` pointer and captures nothing, so the path has
+/// to reach it through a `static`. Each racing edge therefore gets its OWN
+/// `static` rather than sharing one: two tests using the same slot overwrite
+/// each other's path when the harness runs them in parallel, which is a race in
+/// the test scaffolding rather than in the code under test.
+static ROLLBACK_STORE: std::sync::Mutex<Option<std::path::PathBuf>> = std::sync::Mutex::new(None);
+static RESET_STORE: std::sync::Mutex<Option<std::path::PathBuf>> = std::sync::Mutex::new(None);
 
 /// The competing record: a different episode, prepared by "another launch"
 /// during the spawn window, then refused so the parent reaches its rollback.
@@ -245,7 +250,7 @@ fn refuse_after_a_competing_prepare(
     _tier: &'static Tier,
     _tag: &Tag,
 ) -> Result<u32, Refusal> {
-    let path = RACING_STORE.lock().expect("path").clone().expect("path");
+    let path = ROLLBACK_STORE.lock().expect("path").clone().expect("path");
     Store::new(&path).seed_record(&Record::new(
         Phase::Prepared,
         "a-newer-token",
@@ -267,7 +272,7 @@ fn test_a_rollback_does_not_erase_an_episode_prepared_after_it() {
     let dir = tempfile::tempdir().expect("tempdir");
     let store = Store::new(dir.path());
     store.seed_record(&record(Phase::Confirmed, 0, 2));
-    *RACING_STORE.lock().expect("path") = Some(dir.path().to_path_buf());
+    *ROLLBACK_STORE.lock().expect("path") = Some(dir.path().to_path_buf());
     let env = env_from(&[]);
 
     // Wants tier 2, so it prepares a record, spawns, and is refused.
@@ -310,7 +315,7 @@ fn reset_then_refuse(
     _tier: &'static Tier,
     _tag: &Tag,
 ) -> Result<u32, Refusal> {
-    let path = RACING_STORE.lock().expect("path").clone().expect("path");
+    let path = RESET_STORE.lock().expect("path").clone().expect("path");
     let store = Store::new(&path);
     let tx = store.lock().expect("lock");
     let current = store.read();
@@ -329,7 +334,7 @@ fn test_a_reset_is_not_undone_by_a_launch_that_decided_before_it() {
     let dir = tempfile::tempdir().expect("tempdir");
     let store = Store::new(dir.path());
     store.seed_record(&record(Phase::Confirmed, 0, 2));
-    *RACING_STORE.lock().expect("path") = Some(dir.path().to_path_buf());
+    *RESET_STORE.lock().expect("path") = Some(dir.path().to_path_buf());
     let env = env_from(&[]);
 
     let boot = reconcile(
