@@ -87,14 +87,25 @@ Write commands are unaffected. `--format json` (default) returns full fields.
 
 ## Communication Patterns
 
-**Mentions that notify:** Use `@Name` directly in message content — the CLI auto-resolves channel members by name and adds the required p-tags. No `--mention` flag exists or is needed. `nostr:npub1…` inline references are also auto-resolved to p-tags without needing a flag.
+**Mentions that notify:** The CLI auto-resolves only **current channel members** by name and adds their required `p` tags. Before sending `@Name`, resolve the exact pubkey with `buzz users get`, then inspect `buzz channels members --channel <UUID>`. If the person is absent, add them only when authorized: `buzz channels add-member --channel <UUID> --pubkey <hex>`; otherwise report the delivery blocker. After sending, inspect `buzz messages get --channel <UUID>` and verify the emitted event contains `p` plus that exact pubkey. Visible `@Name` text without that tag does **not** notify anyone. No `--mention` flag exists or is needed. `nostr:npub1…` inline references are also auto-resolved to `p` tags when applicable.
 
 ```bash
-# ✅ Correct — notification delivered automatically
-buzz messages send --channel <UUID> --content "@Alice check this"
+# Check membership before notifying a user
+buzz users get
+buzz channels members --channel <UUID>
 
-# Multiple mentions — same pattern
-buzz messages send --channel <UUID> --content "@Alice @Bob review please"
+# Add only when authorized, then send and verify the p-tag in the event
+buzz channels add-member --channel <UUID> --pubkey <hex>
+buzz messages send --channel <UUID> --content "@Alice check this"
+buzz messages get --channel <UUID> --limit 1
+```
+
+**Forum messages:** Forum roots and comments are distinct from stream messages. Send a forum root as kind `45001`; send a forum reply as kind `45003` with `--reply-to <event-id>`. Never use stream kind `9` for a forum root or reply.
+
+```bash
+buzz messages send --channel <FORUM_UUID> --kind 45001 --content "New discussion"
+buzz messages send --channel <FORUM_UUID> --kind 45003 \
+  --reply-to <forum-event-id> --content "Reply"
 ```
 
 ## DM Management

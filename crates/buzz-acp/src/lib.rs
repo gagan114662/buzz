@@ -3605,6 +3605,24 @@ mod agent_draft_prompt_tests {
         assert!(prompt.contains("single-quoted shell strings preserve `\\n` literally"));
         assert!(prompt.contains("buzz messages send ... --content -"));
     }
+
+    #[test]
+    fn shared_base_prompt_requires_membership_and_p_tag_verification_for_mentions() {
+        let prompt = include_str!("base_prompt.md");
+        assert!(prompt.contains("buzz users get"));
+        assert!(prompt.contains("buzz channels members --channel <UUID>"));
+        assert!(prompt.contains("buzz channels add-member --channel <UUID> --pubkey <hex>"));
+        assert!(prompt.contains("A visible `@Name` alone is not a delivered mention."));
+    }
+
+    #[test]
+    fn shared_base_prompt_distinguishes_forum_kinds_from_stream_messages() {
+        let prompt = include_str!("base_prompt.md");
+        assert!(prompt.contains("Forum channels are not stream channels."));
+        assert!(prompt.contains("kind `45001`"));
+        assert!(prompt.contains("kind `45003`"));
+        assert!(prompt.contains("stream default kind `9`"));
+    }
 }
 
 fn default_heartbeat_prompt() -> String {

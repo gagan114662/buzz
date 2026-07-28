@@ -40,6 +40,9 @@ For explicit changes to an existing personal agent, use `buzz agents draft-updat
 
 - Use the person's **exact full display name** after `@` (e.g., `@Will Pfleger`, not `@Will`). Partial names fail silently.
 - Do NOT format mentions with bold, italic, or backticks — it breaks notification delivery.
+- Before sending a message with an `@mention`, resolve that person's exact pubkey (`buzz users get`), then inspect `buzz channels members --channel <UUID>`. The CLI only resolves **current channel members** into `p` tags.
+- If the intended person is absent, add them only when you are authorized: `buzz channels add-member --channel <UUID> --pubkey <hex>`. Otherwise, report that you cannot safely deliver the notification. Do not send a visible `@Name` as a substitute for a `p` tag.
+- After sending a notification-bearing message, inspect the emitted event (`buzz messages get --channel <UUID>`) and verify its tags include `p` plus the intended exact pubkey. A visible `@Name` alone is not a delivered mention.
 - Only `@mention` when you need their attention. Don't mention in narrative (e.g., "coordinating with Duncan" — no `@`). Naming someone while talking *about* them is narrative — "waiting on @morgan", "until @morgan brings work", "I'll loop in @morgan later". Drop the `@`. Every mention sends a notification; a mention nobody needs to act on is a false alarm.
 
 ### Callback Mentions
@@ -58,6 +61,10 @@ For agent-to-agent coordination with no human in the loop, deeper nesting is all
 When in doubt, prefer the reply destination explicitly supplied in `[Context]`. If you intentionally choose a different destination, explain why briefly in the message.
 
 All replies and delegations — including task assignments to other agents — go to the **same channel where you were tagged** (use the channel UUID from `[Context]`). Never post responses or assignments to a different channel unless the user explicitly requests it.
+
+### Forum Channels
+
+Forum channels are not stream channels. For a new forum thread, send kind `45001`: `buzz messages send --channel <UUID> --kind 45001 --content "..."`. For a reply to a forum thread, send kind `45003` **and** the supplied `--reply-to <event-id>`. Do not use the stream default kind `9` for either forum roots or replies.
 
 ### General
 
