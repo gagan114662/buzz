@@ -360,6 +360,69 @@ fn test_a_reset_is_not_undone_by_a_launch_that_decided_before_it() {
 }
 
 #[test]
+fn test_a_launch_whose_write_is_refused_decides_again_from_the_new_state() {
+    // A refusal is not the end of the launch: the decision was about state that
+    // no longer exists, so it has to be retaken against what is there now.
+    // Without that, a refused write would leave this process running a tier it
+    // never persisted, or exiting for a handoff it never made.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let store = Store::new(dir.path());
+    // Reused profile at tier 2, so this launch decides to hand off to tier 2.
+    store.seed_record(&record(Phase::Confirmed, 0, 2));
+
+    // Held across the whole window between this launch's classification and the
+    // prepared write it blocks on, which is the window the race lives in.
+    let tx = store.lock().expect("lock");
+
+    let path = dir.path().to_path_buf();
+    let arrived = Arc::new(Barrier::new(2));
+    let finished = Arc::new(AtomicBool::new(false));
+    let launching = {
+        let (arrived, finished) = (Arc::clone(&arrived), Arc::clone(&finished));
+        std::thread::spawn(move || {
+            let env = env_from(&[]);
+            arrived.wait();
+            let boot = reconcile(Ok(path), IDENTIFIER, VERSION, Vec::new(), &env, accept);
+            finished.store(true, Ordering::SeqCst);
+            boot
+        })
+    };
+
+    arrived.wait();
+    std::thread::sleep(CONTENTION_WINDOW);
+    assert!(
+        !finished.load(Ordering::SeqCst),
+        "the prepared write must block on the state lock, not proceed beside the holder"
+    );
+
+    // Another launch confirms a different tier while this one is parked, so the
+    // record it classified is gone and the decision resting on it is void.
+    let confirmed_elsewhere =
+        Record::new(Phase::Confirmed, "a-newer-token", 0, "no-accel", 3, VERSION);
+    let current = store.read().expect("the confirmed record");
+    store
+        .transition(
+            &tx,
+            Some(Expected::of(&current)),
+            Next::Record(&confirmed_elsewhere),
+        )
+        .expect("confirm another tier");
+    drop(tx);
+
+    // Tier 3 is the discriminator, and only a second classification could have
+    // chosen it: the void decision was tier 2, and a launch that gave up instead
+    // of re-deciding would run here rather than hand off at all.
+    assert!(matches!(
+        launching.join().expect("the launch"),
+        Boot::HandedOff
+    ));
+    let prepared = store.read().expect("the retaken decision's record");
+    assert_eq!(prepared.phase, Phase::Prepared);
+    assert_eq!(prepared.tier, 3);
+    assert_eq!(store.claim_count(), 0);
+}
+
+#[test]
 fn test_a_version_mismatch_discard_does_not_delete_a_newer_episode() {
     // The mirror race: this launch classifies a record from another app version
     // and decides to discard it, but by the time it writes, a current-version
