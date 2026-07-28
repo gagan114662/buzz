@@ -1,4 +1,5 @@
 import { bytesToHex, hexToBytes } from "@noble/hashes/utils.js";
+import { emit } from "@tauri-apps/api/event";
 import { mockIPC, mockWindows } from "@tauri-apps/api/mocks";
 import { decode } from "nostr-tools/nip19";
 import { finalizeEvent, getPublicKey } from "nostr-tools/pure";
@@ -233,6 +234,14 @@ type E2eConfig = {
       mcp?: MockCommandAvailability;
     };
     managedAgents?: MockManagedAgentSeed[];
+    /** Result returned by the mocked `add_agent_to_huddle` command. */
+    addAgentToHuddleResult?: {
+      ephemeral_added: boolean;
+      parent_added: boolean;
+      parent_error: string | null;
+    };
+    /** Delay an invocation-time huddle snapshot to exercise hydration ordering. */
+    huddleStateReadDelayMs?: number;
     /** Per agent+relay runtime rows for the pair-scoped lifecycle commands
      *  (`list/start/stop/restart_managed_agent_runtime`). */
     managedAgentRuntimes?: MockManagedAgentRuntimeSeed[];
@@ -1048,7 +1057,7 @@ declare global {
     __BUZZ_E2E_SET_MOCK_HUDDLE_SNAPSHOT__?: (input: {
       members: MockHuddleMemberSeed[];
       transcriptionEnabled: boolean;
-    }) => void;
+    }) => Promise<void>;
     __BUZZ_E2E_PUSH_MOCK_FEED_ITEM__?: (item: RawFeedItem) => RawFeedItem;
     /** Replace an existing feed item by id (or push if not found) and fire the updated event. */
     __BUZZ_E2E_REPLACE_MOCK_FEED_ITEM__?: (
@@ -2898,10 +2907,6 @@ function resetMockMesh() {
 }
 let mockPersonas: RawPersona[] = [];
 let mockTeams: RawTeam[] = [];
-// Listeners registered via the mock __TAURI_INTERNALS__.listen — keyed by event name.
-type MockTauriEvent = { payload: unknown };
-type MockTauriEventCallback = (event: MockTauriEvent) => void;
-const tauriEventListeners = new Map<string, Set<MockTauriEventCallback>>();
 
 type MockHuddleState = {
   phase: "active";
@@ -2932,11 +2937,9 @@ function persistMockHuddle() {
   }
 }
 
-function emitMockHuddleState() {
+async function emitMockHuddleState() {
   if (!mockHuddle) return;
-  for (const cb of tauriEventListeners.get("huddle-state-changed") ?? []) {
-    cb({ payload: structuredClone(mockHuddle.state) });
-  }
+  await emit("huddle-state-changed", structuredClone(mockHuddle.state));
 }
 
 function refreshMockHuddleMembership() {
@@ -9261,7 +9264,7 @@ export function maybeInstallE2eTauriMocks() {
   window.__BUZZ_E2E_COMMAND_LOG__ = [];
   window.__BUZZ_E2E_SIGNED_EVENTS__ = [];
   window.__BUZZ_E2E_WEBVIEW_ZOOM__ = 1;
-  window.__BUZZ_E2E_SET_MOCK_HUDDLE_SNAPSHOT__ = ({
+  window.__BUZZ_E2E_SET_MOCK_HUDDLE_SNAPSHOT__ = async ({
     members,
     transcriptionEnabled,
   }) => {
@@ -9272,7 +9275,7 @@ export function maybeInstallE2eTauriMocks() {
     mockHuddle.state.transcription_enabled = transcriptionEnabled;
     refreshMockHuddleMembership();
     persistMockHuddle();
-    emitMockHuddleState();
+    await emitMockHuddleState();
   };
   window.__BUZZ_E2E_EMIT_MOCK_MESSAGE__ = ({
     channelName,
@@ -9546,9 +9549,14 @@ export function maybeInstallE2eTauriMocks() {
     window.__BUZZ_E2E_COMMAND_LOG__?.push({ command, payload });
 
     switch (command) {
-      case "get_huddle_state":
-        if (!mockHuddle) return null;
-        return structuredClone(mockHuddle.state);
+      case "get_huddle_state": {
+        const snapshot = mockHuddle ? structuredClone(mockHuddle.state) : null;
+        const delayMs = activeConfig?.mock?.huddleStateReadDelayMs ?? 0;
+        if (delayMs > 0) {
+          await new Promise((resolve) => window.setTimeout(resolve, delayMs));
+        }
+        return snapshot;
+      }
       case "get_huddle_agent_pubkeys":
         if (!mockHuddle) return [];
         return [...mockHuddle.state.agent_pubkeys];
@@ -9560,8 +9568,15 @@ export function maybeInstallE2eTauriMocks() {
           (payload as { enabled?: boolean }).enabled,
         );
         persistMockHuddle();
-        emitMockHuddleState();
+        await emitMockHuddleState();
         return null;
+      case "add_agent_to_huddle": {
+        const result = activeConfig?.mock?.addAgentToHuddleResult;
+        if (!result) {
+          throw new Error("No mock add-agent result configured.");
+        }
+        return structuredClone(result);
+      }
       case "get_model_status":
         return { stt: "ready", tts: "ready" };
       case "get_builderlab_auth":
@@ -10410,9 +10425,7 @@ export function maybeInstallE2eTauriMocks() {
           }
         }
         // Mirror the real Rust backend: emit "agents-data-changed" after reconcile.
-        for (const cb of tauriEventListeners.get("agents-data-changed") ?? []) {
-          cb({ payload: null });
-        }
+        await emit("agents-data-changed");
         return undefined;
       }
       case "set_persona_active":
@@ -11208,9 +11221,6 @@ export function maybeInstallE2eTauriMocks() {
       case "plugin:webview|set_webview_zoom":
         window.__BUZZ_E2E_WEBVIEW_ZOOM__ = (payload as { value: number }).value;
         return;
-      case "plugin:event|listen":
-        // Tauri event system (pairing, huddle) — no-op in e2e, return unlisten fn ID
-        return Math.floor(Math.random() * 1_000_000);
       case "start_pairing": {
         const delayMs = activeConfig?.mock?.pairingStartDelayMs ?? 0;
         if (delayMs > 0) {
@@ -11395,33 +11405,6 @@ export function maybeInstallE2eTauriMocks() {
   window.__BUZZ_E2E_INVOKE_MOCK_COMMAND__ = (command, payload) =>
     handleMockCommand(command, payload ?? null);
   mockIPC(handleMockCommand, { shouldMockEvents: true });
-
-  // Wire up __TAURI_INTERNALS__.listen so tests can subscribe to backend-emitted
-  // events (e.g. "agents-data-changed"). mockIPC already ensures __TAURI_INTERNALS__
-  // exists; we just add the listen property without clobbering invoke.
-  (
-    window as unknown as {
-      __TAURI_INTERNALS__: {
-        listen?: (
-          event: string,
-          cb: MockTauriEventCallback,
-        ) => Promise<() => void>;
-      };
-    }
-  ).__TAURI_INTERNALS__.listen = async (
-    event: string,
-    cb: MockTauriEventCallback,
-  ) => {
-    let listeners = tauriEventListeners.get(event);
-    if (!listeners) {
-      listeners = new Set();
-      tauriEventListeners.set(event, listeners);
-    }
-    listeners.add(cb);
-    return () => {
-      tauriEventListeners.get(event)?.delete(cb);
-    };
-  };
 
   installed = true;
 }

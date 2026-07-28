@@ -242,7 +242,10 @@ export function HuddleBar({
 
     // Primary: listen for Rust-emitted state change events
     listen<HuddleState>("huddle-state-changed", (event) => {
-      if (!cancelled) applyIncomingState(event.payload);
+      if (!cancelled) {
+        stateGenerationRef.current += 1;
+        applyIncomingState(event.payload);
+      }
     }).then((fn) => {
       if (cancelled) fn();
       else unlisten = fn;
