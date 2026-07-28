@@ -96,10 +96,10 @@ pub async fn check_pipeline_hotstart(state: State<'_, AppState>) -> Result<(), S
     // Periodically refresh agent_pubkeys from relay membership.
     // This catches mid-huddle agent additions/removals by other participants,
     // keeping STT p-tags authoritative throughout the session.
-    // Throttled to every 15 s (not on every 5 s hotstart poll).
+    // Throttled independently from the more frequent hotstart poll.
     //
-    // NOTE: The frontend ALSO polls agent membership independently (every 10 s
-    // via get_huddle_agent_pubkeys). This is intentional — the two polls have
+    // NOTE: The frontend ALSO polls agent membership independently via
+    // get_huddle_agent_pubkeys. This is intentional — the two polls have
     // different failure semantics:
     //   - Rust (here): preserves stale list on failure (STT p-tags should not
     //     disappear on a transient network blip).
@@ -117,8 +117,8 @@ pub async fn check_pipeline_hotstart(state: State<'_, AppState>) -> Result<(), S
             }
         };
         if should_refresh {
-            // Fetch agents (for STT p-tags) and all members (for participant list).
-            // Sequential — tokio::join! requires the `macros` feature.
+            // Fetch agents (for STT p-tags) before all members (for participant
+            // list) so relay membership queries remain ordered.
             // Only update the throttle timestamp when at least one fetch succeeds,
             // so transient failures retry immediately on the next poll cycle.
             // Fetch both lists before acquiring the lock — no lock held across await.
