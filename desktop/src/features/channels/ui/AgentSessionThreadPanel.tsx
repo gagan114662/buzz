@@ -67,6 +67,8 @@ import type { ChannelAgentSessionAgent } from "./useChannelAgentSessions";
 import { useChannelsQuery } from "@/features/channels/hooks";
 import { CausalSessionTimeline } from "@/features/agents/ui/CausalSessionTimeline";
 import { CausalCandidateCard } from "@/features/agents/ui/CausalCandidateCard";
+import { NumbatSecurityFindings } from "@/features/agents/ui/NumbatSecurityFindings";
+import { useNumbatFindings } from "@/features/agents/ui/useNumbatFindings";
 
 type AgentSessionThreadPanelProps = {
   agent: ChannelAgentSessionAgent;
@@ -112,6 +114,7 @@ export function AgentSessionThreadPanel({
     sessionChannelId,
   );
   const canStopCurrentTurn = isWorking && canInterruptTurn;
+  const numbatFindings = useNumbatFindings(agent.pubkey, sessionChannelId);
   useEscapeKey(onClose, isOverlay || isSinglePanelView);
 
   const scrollRef = React.useRef<HTMLDivElement>(null);
@@ -144,6 +147,14 @@ export function AgentSessionThreadPanel({
         ?.sessionId ?? null,
     [combinedHeaderEvents],
   );
+  const activeTurnId = React.useMemo(() => {
+    if (!isWorking) return null;
+    for (let index = combinedHeaderEvents.length - 1; index >= 0; index -= 1) {
+      const turnId = combinedHeaderEvents[index]?.turnId;
+      if (turnId) return turnId;
+    }
+    return null;
+  }, [combinedHeaderEvents, isWorking]);
   const latestActivityAt = React.useMemo(
     () => getLatestActivityTimestamp(combinedHeaderEvents),
     [combinedHeaderEvents],
@@ -567,6 +578,13 @@ export function AgentSessionThreadPanel({
             agentPubkey={agent.pubkey}
             channelId={sessionChannelId}
             sessionId={activeSessionId}
+          />
+          <NumbatSecurityFindings
+            activeTurnId={activeTurnId}
+            canCancelTurn={canStopCurrentTurn}
+            error={numbatFindings.error}
+            findings={numbatFindings.findings}
+            onCancelTurn={() => void handleInterruptTurn()}
           />
           <ManagedAgentSessionPanel
             agent={agent}
