@@ -252,6 +252,24 @@ type MockBridgeOptions = {
   relayAgents?: MockRelayAgentSeed[];
   /** Delay both managed and relay agent directory reads. */
   agentListDelayMs?: number;
+  numbatFindingBatch?: {
+    nextOffset: number;
+    reset: boolean;
+    rejectedRecords: number;
+    health: { state: string; detail: string };
+    findings: Array<{
+      findingId: string;
+      ruleId: string;
+      title: string;
+      severity: "low" | "medium" | "high" | "critical";
+      detectedAt: string;
+      sourceAgent: string;
+      sessionId: string | null;
+      channelId: string | null;
+      turnId: string | null;
+      evidenceCount: number;
+    }>;
+  };
   createManagedAgentDelayMs?: number;
   channelTemplates?: ChannelTemplate[];
   addChannelMembersDelayMs?: number;
