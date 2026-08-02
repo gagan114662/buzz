@@ -11,6 +11,7 @@ version = "0.5.5"
 description = "Buzz desktop app"
 authors = ["you"]
 edition = "2021"
+default-run = "buzz-desktop"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
