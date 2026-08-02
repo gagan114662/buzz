@@ -89,6 +89,7 @@ import { ProfileSettingsCard } from "./ProfileSettingsCard";
 import { UpdateChecker } from "../UpdateChecker";
 import { SettingsSectionHeader } from "./SettingsSectionHeader";
 import { VoiceSettingsCard } from "./VoiceSettingsCard";
+import { GuardianNumbatSettingsCard } from "./GuardianNumbatSettingsCard";
 
 export type SettingsSection =
   | "profile"
@@ -876,6 +877,7 @@ export function renderSettingsSection(
       return (
         <div className="space-y-12">
           <PreventSleepSettingsCard />
+          <GuardianNumbatSettingsCard />
           <HarnessesSettingsPanel />
           <AgentDefaultsSettingsCard />
         </div>
