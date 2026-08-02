@@ -236,6 +236,8 @@ pub(crate) fn prospective_spawn_config_snapshot(
                     command,
                     args,
                     env: Default::default(),
+                    guardian_policy:
+                        crate::managed_agents::readiness::GuardianPermissionPolicy::Monitor,
                 }
             });
 
