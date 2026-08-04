@@ -54,27 +54,25 @@ import {
 } from "@/features/agents/ui/buzzAgentModelTuningFields";
 import { SettingsOptionGroup } from "@/features/settings/ui/SettingsOptionGroup";
 import { AdvancedRequiredBadge } from "./AdvancedRequiredBadge";
+import { GuardianPolicyField } from "./GuardianPolicyField";
+import { getGenericEnvVars, mergeGenericEnvVars } from "./guardianPolicy";
 import { getGlobalAgentCredentialState } from "./globalAgentCredentialState";
-
 export const EMPTY_GLOBAL_CONFIG: GlobalAgentConfig = {
   env_vars: {},
   provider: null,
   model: null,
   preferred_runtime: null,
 };
-
-/** Baked env keys that route to structured controls, not the generic env editor. */
+/** Baked env keys routed to structured controls, not the generic env editor. */
 const BAKED_STRUCTURED_KEYS = new Set([
   "BUZZ_AGENT_PROVIDER",
   "BUZZ_AGENT_MODEL",
   BUZZ_AGENT_THINKING_EFFORT,
 ]);
-
 const PROGRESSIVE_FIELDS_TRANSITION = {
   duration: 0.22,
   ease: [0.23, 1, 0.32, 1],
 } as const;
-
 type AgentConfigDisclosure =
   | "full"
   | "onboarding-essential"
@@ -575,14 +573,10 @@ export function AgentConfigFields({
   }
 
   function handleEnvVarsChange(next: Record<string, string>) {
-    const effort = effortPersistenceKey
-      ? config.env_vars[effortPersistenceKey]
-      : undefined;
-    const merged = { ...next };
-    if (effortPersistenceKey && effort !== undefined) {
-      merged[effortPersistenceKey] = effort;
-    }
-    onConfigChange({ ...config, env_vars: merged });
+    onConfigChange({
+      ...config,
+      env_vars: mergeGenericEnvVars(config.env_vars, next),
+    });
   }
 
   // On internal Block builds, BUZZ_AGENT_PROVIDER is baked in and a boot
@@ -866,7 +860,11 @@ export function AgentConfigFields({
           />
         </div>
       ) : null}
-
+      {showAdvancedFields ? (
+        <GuardianPolicyField
+          {...{ blockClassName, config, fieldLabelClassName, onConfigChange }}
+        />
+      ) : null}
       {showAdvancedFields ? (
         <div className={cn(blockClassName, "space-y-3")}>
           <button
@@ -915,11 +913,7 @@ export function AgentConfigFields({
                     label="Environment variables"
                     onChange={handleEnvVarsChange}
                     requiredKeys={advancedRequiredEnvKeys}
-                    value={Object.fromEntries(
-                      Object.entries(config.env_vars).filter(
-                        ([k]) => k !== BUZZ_AGENT_THINKING_EFFORT,
-                      ),
-                    )}
+                    value={getGenericEnvVars(config.env_vars)}
                   />
                 </motion.div>
               ) : null}
@@ -933,11 +927,7 @@ export function AgentConfigFields({
               label="Environment variables"
               onChange={handleEnvVarsChange}
               requiredKeys={advancedRequiredEnvKeys}
-              value={Object.fromEntries(
-                Object.entries(config.env_vars).filter(
-                  ([k]) => k !== BUZZ_AGENT_THINKING_EFFORT,
-                ),
-              )}
+              value={getGenericEnvVars(config.env_vars)}
             />
           ) : null}
         </div>

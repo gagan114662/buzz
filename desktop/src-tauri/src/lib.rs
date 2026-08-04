@@ -4,9 +4,14 @@ mod archive;
 mod builderlab;
 mod commands;
 mod deep_link;
+mod egress_guard;
 mod event_sync;
 mod events;
+pub mod guardian_distribution;
 mod huddle;
+mod identity_storage;
+mod key_backup;
+mod linux_media;
 mod managed_agents;
 mod media_proxy;
 #[cfg(feature = "mesh-llm")]
@@ -28,7 +33,11 @@ mod reset;
 mod secret_store;
 mod shutdown;
 mod templates;
+#[cfg(target_os = "macos")]
+mod tray_menu;
 mod util;
+#[cfg(target_os = "linux")]
+pub mod webkit_rendering;
 use app_state::{build_app_state, resolve_persisted_identity, AppState};
 use builderlab::*;
 use commands::*;
@@ -57,14 +66,13 @@ use mesh_llm_stubs::*;
 #[cfg(all(feature = "mesh-llm", target_os = "macos"))]
 use shutdown::{hard_exit_after_mesh_shutdown, relaunch_after_mesh_shutdown};
 use shutdown::{is_restart_request, shut_down_app};
-use std::sync::{
-    atomic::{AtomicBool, Ordering},
-    Arc,
-};
-#[cfg(target_os = "macos")]
-use tauri::Listener;
+use std::sync::{atomic::AtomicBool, atomic::Ordering, Arc};
 use tauri::{Emitter, Manager, RunEvent};
+#[cfg(target_os = "macos")]
+use tauri::{Listener, WindowEvent};
 use tauri_plugin_window_state::StateFlags;
+#[cfg(target_os = "macos")]
+use tray_menu::show_main_window;
 
 #[cfg(target_os = "macos")]
 const INITIAL_RENDER_READY_EVENT: &str = "initial-render-ready";
@@ -81,9 +89,7 @@ fn reveal_initial_window<R: tauri::Runtime>(window: &tauri::Window<R>) {
 
 #[cfg(target_os = "macos")]
 fn set_initial_window_backing<R: tauri::Runtime>(window: &tauri::Window<R>) {
-    // The window remains transparent at runtime for vibrancy. Use an opaque
-    // native backing only across the first visible frames so the previous app
-    // cannot show through before WebKit has submitted its first surface.
+    // Use opaque native backing only for the first frames so the previous app cannot show through.
     if let Err(error) = window.set_background_color(Some(tauri::window::Color(17, 21, 24, 255))) {
         eprintln!("buzz-desktop: failed to set initial window backing: {error}");
     }
@@ -192,6 +198,11 @@ pub fn run() {
                     if webview.label() != "main" {
                         return;
                     }
+
+                    // Linux/WebKitGTK needs media-stream settings and a
+                    // permission-request handler for getUserMedia; no-op
+                    // on macOS/Windows.
+                    linux_media::enable_media_capture(&webview);
 
                     // macOS applies the restored geometry asynchronously. Wait
                     // for several identical outer bounds and for React to
@@ -358,6 +369,8 @@ pub fn run() {
         .manage(commands::pairing::PairingHandle::new())
         .setup(move |app| {
             let app_handle = app.handle().clone();
+            #[cfg(target_os = "macos")]
+            tray_menu::init(&app_handle)?;
 
             // ── Phase 2: boot-time sentinel wipe ──────────────────────────────
             // Must run before migrations and identity resolution so the wipe
@@ -378,27 +391,20 @@ pub fn run() {
             };
 
             if reset_outcome.failed {
-                // Surface reset-failed state — skip identity resolution and
-                // all side-effecting setup. The webview still loads so the
-                // frontend can show the recovery screen via get_identity.
+                // Skip identity resolution and setup, but load the webview so the frontend can
+                // show the recovery screen via get_identity.
                 let state = app_handle.state::<AppState>();
                 state
                     .reset_failed
                     .store(true, std::sync::atomic::Ordering::Release);
                 return Ok(());
             }
-
-            // Run all pre-identity data migrations before state loads from disk.
             if reset_outcome.completed {
                 migration::run_boot_migrations_after_reset(&app_handle);
             } else {
                 migration::run_boot_migrations(&app_handle);
             }
-
-            // Resolve persisted identity key (env var → file → generate+save).
-            // This is fatal — the app should not start with an ephemeral identity
-            // that will be lost on restart, as that silently breaks channel
-            // memberships, DMs, and relay identity.
+            guardian_distribution::commands::recover_guardian_numbat_on_boot(&app_handle);
             let state = app_handle.state::<AppState>();
             if let Err(e) = resolve_persisted_identity(&app_handle, &state) {
                 eprintln!("buzz-desktop: fatal: identity resolution failed: {e}");
@@ -448,6 +454,18 @@ pub fn run() {
             // through every call site.
             if let Ok(mut guard) = state.app_handle.lock() {
                 *guard = Some(app_handle.clone());
+            }
+
+            let (tts_settings, tts_settings_load_error) =
+                huddle::tts_settings::load_for_app(&app_handle);
+            if let Ok(mut guard) = state.huddle_audio.tts.lock() {
+                *guard = tts_settings.clone();
+            }
+            if let Ok(mut guard) = state.huddle_audio.tts_load_error.lock() {
+                *guard = tts_settings_load_error;
+            }
+            if let Ok(mut huddle) = state.huddle_state.lock() {
+                huddle.tts_enabled = tts_settings.agent_text_to_speech;
             }
 
             // Bring up the runtime-owned shared-compute coordinator before
@@ -655,6 +673,10 @@ pub fn run() {
             title_bar_double_click,
             get_identity,
             get_nsec,
+            generate_backup_passphrase,
+            create_ncryptsec_backup,
+            verify_ncryptsec_backup,
+            save_ncryptsec_copy,
             import_identity,
             persist_current_identity,
             get_profile,
@@ -706,6 +728,13 @@ pub fn run() {
             decrypt_observer_event,
             build_observer_control_event,
             read_numbat_findings,
+            guardian_distribution::commands::get_guardian_numbat_status,
+            guardian_distribution::commands::install_guardian_numbat,
+            guardian_distribution::commands::cancel_guardian_numbat_install,
+            guardian_distribution::commands::activate_guardian_numbat,
+            guardian_distribution::commands::deactivate_guardian_numbat,
+            guardian_distribution::commands::rollback_guardian_numbat,
+            guardian_distribution::commands::uninstall_guardian_numbat,
             create_auth_event,
             nip44_encrypt_to_self,
             nip44_decrypt_from_self,
@@ -819,6 +848,12 @@ pub fn run() {
             update_team,
             delete_team,
             export_agent_snapshot,
+            card_mint_key_status,
+            card_mint_save_openai_key,
+            mint_agent_card,
+            save_agent_card,
+            list_agent_cards,
+            load_agent_card,
             preview_agent_snapshot_import,
             confirm_agent_snapshot_import,
             encode_agent_snapshot_for_send,
@@ -857,6 +892,12 @@ pub fn run() {
             download_voice_models,
             get_model_status,
             set_tts_enabled,
+            huddle::tts_settings::get_tts_settings,
+            huddle::tts_settings::list_voice_registry,
+            huddle::tts_settings::set_pocket_voice,
+            huddle::tts_settings::preview_pocket_voice,
+            huddle::tts_settings::import_pocket_voice,
+            huddle::tts_settings::delete_pocket_voice,
             speak_agent_message,
             add_agent_to_huddle,
             check_pipeline_hotstart,
@@ -894,6 +935,14 @@ pub fn run() {
             archive::read_unindexed_observer_rows,
             is_auto_update_supported,
             set_window_vibrancy,
+            #[cfg(target_os = "macos")]
+            tray_menu::clear_tray_agent_activity,
+            #[cfg(target_os = "macos")]
+            tray_menu::requeue_tray_actions,
+            #[cfg(target_os = "macos")]
+            tray_menu::take_tray_actions,
+            #[cfg(target_os = "macos")]
+            tray_menu::update_tray_agent_activity,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application");
@@ -906,6 +955,22 @@ pub fn run() {
     let run_shutdown_done = Arc::clone(&shutdown_done);
     let restart_requested = Arc::new(AtomicBool::new(false));
     app.run(move |app_handle, event| match event {
+        #[cfg(target_os = "macos")]
+        RunEvent::Reopen { .. } => show_main_window(app_handle),
+        #[cfg(target_os = "macos")]
+        RunEvent::WindowEvent {
+            label,
+            event: WindowEvent::CloseRequested { api, .. },
+            ..
+        } if label == "main" => {
+            // Keep the webview alive so Buzz can be reopened from its tray menu.
+            api.prevent_close();
+            if let Some(window) = app_handle.get_webview_window("main") {
+                if let Err(error) = window.hide() {
+                    eprintln!("buzz-desktop: failed to hide main window: {error}");
+                }
+            }
+        }
         RunEvent::ExitRequested { code, .. } => {
             if is_restart_request(code) {
                 restart_requested.store(true, Ordering::SeqCst);

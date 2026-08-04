@@ -291,6 +291,11 @@ pub fn build_managed_agent_summary(
             command: cmd,
             args,
             env: Default::default(),
+            guardian_policy: crate::managed_agents::readiness::GuardianPermissionPolicy::Monitor,
+            guardian_protection: crate::managed_agents::readiness::guardian_runtime_protection(
+                "custom",
+                crate::managed_agents::HarnessSource::Custom,
+            ),
         }
     });
     let effective_mcp_command = known_acp_runtime(&descriptor.command)
@@ -424,6 +429,7 @@ pub fn spawn_agent_child(
                     crate::managed_agents::user_facing_harness_error(&e)
                 )
             })?;
+    crate::managed_agents::readiness::validate_guardian_launch(&descriptor)?;
     let effective_command = &descriptor.command;
     let agent_args = &descriptor.args;
 
@@ -804,9 +810,16 @@ pub fn spawn_agent_child(
     // applied. Writing it last lets user-provided values win over every Buzz-set env
     // written above — reserved keys were already stripped from descriptor.env so they
     // cannot clobber BUZZ_PRIVATE_KEY, NOSTR_PRIVATE_KEY, etc.
+    // Managed agents are monitor-first, while the layered descriptor may
+    // explicitly select lockdown. Resolve it at the spawn boundary so an
+    // absent setting never inherits an unsafe ambient parent value.
     for (key, value) in &descriptor.env {
         command.env(key, value);
     }
+    // Guardian policy is a security boundary. Stamp the resolved value after
+    // the general environment so ambient or layered data cannot overwrite it
+    // at the process boundary.
+    apply_guardian_permission_env(&mut command, descriptor.guardian_policy);
     configure_runtime_cli(&mut command, runtime_meta);
 
     // Buzz shared compute is stored as a native provider; derive the OpenAI-compatible
@@ -816,12 +829,7 @@ pub fn spawn_agent_child(
     // uses the same trim semantics as the preflight callers.
     #[cfg(feature = "mesh-llm")]
     if let Some(ref mesh_model_id) = mesh_model_id {
-        let mut mesh_env = std::collections::BTreeMap::new();
-        super::apply_relay_mesh_env(
-            &mut mesh_env,
-            Some(super::RELAY_MESH_PROVIDER_ID),
-            Some(mesh_model_id.as_str()),
-        );
+        let mesh_env = super::relay_mesh_process_env(&descriptor.env, mesh_model_id);
         command.env_remove("OPENAI_API_KEY");
         for (key, value) in mesh_env {
             command.env(key, value);
@@ -910,6 +918,13 @@ pub fn spawn_agent_child(
     })
 }
 
+fn apply_guardian_permission_env(
+    command: &mut std::process::Command,
+    policy: crate::managed_agents::readiness::GuardianPermissionPolicy,
+) {
+    command.env("BUZZ_ACP_PERMISSION_MODE", policy.as_env_value());
+}
+
 fn child_rust_log_filter() -> String {
     match std::env::var("RUST_LOG") {
         Ok(existing) if existing.contains("buzz_acp") => existing,
@@ -974,6 +989,9 @@ pub fn start_managed_agent_process(
     runtimes.insert(key, ManagedAgentPairRuntime::starting(process));
     Ok(())
 }
+
+#[cfg(test)]
+mod guardian_policy_tests;
 
 #[cfg(test)]
 mod tests;

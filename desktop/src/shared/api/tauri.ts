@@ -3,6 +3,14 @@ import {
   activateRateLimit,
   parseRateLimitHint,
 } from "@/shared/api/relayRateLimitGate";
+import {
+  fromRawInstallRuntimeResult,
+  type RawInstallRuntimeResult,
+} from "@/shared/api/installTypes";
+import {
+  fromRawGuardianProtection,
+  type RawGuardianProtection,
+} from "@/shared/api/guardianProtection";
 import type {
   AddChannelMembersInput,
   AddChannelMembersResult,
@@ -195,29 +203,14 @@ export type RawAcpRuntimeCatalogEntry = {
   auth_status: AuthStatus;
   login_hint?: string;
   source: "builtin" | "preset" | "custom";
-  /**
-   * Definition-level env vars for `source: custom` entries.
-   * Omitted/absent for builtin and preset — skipped in Rust serialization when empty.
-   */
+  guardian_protection?: RawGuardianProtection;
   definition_env?: Record<string, string>;
 };
 
-export type RawInstallStepResult = {
-  step: string;
-  command: string;
-  success: boolean;
-  stdout: string;
-  stderr: string;
-  exit_code: number | null;
-  hint?: string;
-};
-
-export type RawInstallRuntimeResult = {
-  success: boolean;
-  steps: RawInstallStepResult[];
-  restarted_count: number;
-  failed_restart_count: number;
-};
+export type {
+  RawInstallRuntimeResult,
+  RawInstallStepResult,
+} from "./installTypes";
 
 type RawGitBashPrerequisite = {
   available: boolean;
@@ -766,28 +759,8 @@ export function fromRawAcpRuntimeCatalogEntry(
     authStatus: entry.auth_status,
     loginHint: entry.login_hint ?? null,
     source: entry.source,
-    // Map definition_env (snake_case from Rust) to definitionEnv (camelCase).
-    // Absent when empty (Rust serialization skips empty BTreeMap) — default to {}.
+    guardianProtection: fromRawGuardianProtection(entry.guardian_protection),
     definitionEnv: entry.definition_env ?? {},
-  };
-}
-
-function fromRawInstallRuntimeResult(
-  raw: RawInstallRuntimeResult,
-): InstallRuntimeResult {
-  return {
-    success: raw.success,
-    steps: raw.steps.map((step) => ({
-      step: step.step,
-      command: step.command,
-      success: step.success,
-      stdout: step.stdout,
-      stderr: step.stderr,
-      exitCode: step.exit_code,
-      hint: step.hint,
-    })),
-    restartedCount: raw.restarted_count,
-    failedRestartCount: raw.failed_restart_count,
   };
 }
 

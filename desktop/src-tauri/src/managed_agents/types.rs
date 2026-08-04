@@ -587,7 +587,8 @@ pub struct ManagedAgentLogResponse {
 pub enum AcpAvailabilityStatus {
     Available,
     AdapterMissing,
-    /// Adapter binary is present but is from the deprecated package (< 1.0). Reinstall required.
+    /// Adapter binary is present but unsupported — either the deprecated
+    /// package or a version below the supported floor. Reinstall required.
     AdapterOutdated,
     CliMissing,
     NotInstalled,
@@ -662,8 +663,8 @@ pub struct AcpRuntimeCatalogEntry {
     /// Whether this entry came from the compiled-in catalog or a user-supplied
     /// JSON file in `custom_harnesses/`. The UI uses this to decide editability.
     pub source: HarnessSource,
-    /// Definition-level environment variables for `source: custom` entries.
-    ///
+    pub guardian_protection: super::guardian_protection::GuardianRuntimeProtection,
+    /// Definition-level environment variables for custom entries.
     /// Populated from `HarnessDefinition.env` so the edit form can read them
     /// back and the user doesn't silently lose env vars when saving.  Always
     /// empty for `builtin` and `preset` entries (those env values come from the
@@ -701,6 +702,10 @@ pub struct InstallRuntimeResult {
     /// Number of agents whose stop succeeded but respawn failed.
     /// Mirrors `GlobalAgentConfigSaveResult.failed_restart_count`.
     pub failed_restart_count: u32,
+    /// Install log file for this run, when one was written. The UI surfaces it
+    /// on failure so a user can read the full retry history instead of only the
+    /// last step's truncated output. `None` when no log could be opened.
+    pub log_path: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
