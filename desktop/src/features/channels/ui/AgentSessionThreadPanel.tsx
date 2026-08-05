@@ -64,6 +64,7 @@ import { useLoadOlderOnScroll } from "@/features/messages/ui/useLoadOlderOnScrol
 import type { ChannelAgentSessionAgent } from "./useChannelAgentSessions";
 import { useChannelsQuery } from "@/features/channels/hooks";
 import { NumbatSecurityFindings } from "@/features/agents/ui/NumbatSecurityFindings";
+import { CausalSessionTimeline } from "@/features/agents/ui/CausalSessionTimeline";
 import { useNumbatFindings } from "@/features/agents/ui/useNumbatFindings";
 
 type AgentSessionThreadPanelProps = {
@@ -515,6 +516,10 @@ export function AgentSessionThreadPanel({
       >
         <div ref={topSentinelRef} aria-hidden className="h-px" />
         <div ref={contentRef}>
+          <CausalSessionTimeline
+            events={combinedHeaderEvents}
+            findings={numbatFindings.findings}
+          />
           <NumbatSecurityFindings
             error={numbatFindings.error}
             findings={numbatFindings.findings}
