@@ -521,7 +521,11 @@ export function AgentSessionThreadPanel({
             events={combinedHeaderEvents}
             findings={numbatFindings.findings}
           />
-          <CausalCandidateCard sessionId={activeSessionId} />
+          <CausalCandidateCard
+            agentPubkey={agent.pubkey}
+            channelId={sessionChannelId}
+            sessionId={activeSessionId}
+          />
           <NumbatSecurityFindings
             error={numbatFindings.error}
             findings={numbatFindings.findings}
