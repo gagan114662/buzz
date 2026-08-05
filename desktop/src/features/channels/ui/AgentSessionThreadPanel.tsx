@@ -563,7 +563,11 @@ export function AgentSessionThreadPanel({
             events={combinedHeaderEvents}
             findings={[]}
           />
-          <CausalCandidateCard sessionId={activeSessionId} />
+          <CausalCandidateCard
+            agentPubkey={agent.pubkey}
+            channelId={sessionChannelId}
+            sessionId={activeSessionId}
+          />
           <ManagedAgentSessionPanel
             agent={agent}
             channelId={sessionChannelId}
