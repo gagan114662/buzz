@@ -65,6 +65,7 @@ import { useLoadArchivedObserverEvents } from "@/features/agents/ui/useObserverE
 import { useLoadOlderOnScroll } from "@/features/messages/ui/useLoadOlderOnScroll";
 import type { ChannelAgentSessionAgent } from "./useChannelAgentSessions";
 import { useChannelsQuery } from "@/features/channels/hooks";
+import { CausalSessionTimeline } from "@/features/agents/ui/CausalSessionTimeline";
 
 type AgentSessionThreadPanelProps = {
   agent: ChannelAgentSessionAgent;
@@ -551,6 +552,10 @@ export function AgentSessionThreadPanel({
               sessionId={latestSessionId}
             />
           ) : null}
+          <CausalSessionTimeline
+            events={combinedHeaderEvents}
+            findings={[]}
+          />
           <ManagedAgentSessionPanel
             agent={agent}
             channelId={sessionChannelId}
