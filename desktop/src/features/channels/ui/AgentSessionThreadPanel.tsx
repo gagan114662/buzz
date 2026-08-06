@@ -140,7 +140,7 @@ export function AgentSessionThreadPanel({
   );
   const activeSessionId = React.useMemo(
     () =>
-      combinedHeaderEvents.findLast((event) => Boolean(event.sessionId))
+      [...combinedHeaderEvents].reverse().find((event) => event.sessionId)
         ?.sessionId ?? null,
     [combinedHeaderEvents],
   );
