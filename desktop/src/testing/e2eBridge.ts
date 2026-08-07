@@ -12146,6 +12146,10 @@ export function maybeInstallE2eTauriMocks() {
           (payload as Parameters<typeof handleGetAgentMemory>[0]) ?? {},
           activeConfig,
         );
+      case "delete_agent_memories": {
+        const entries = (payload as { entries?: unknown })?.entries;
+        return Array.isArray(entries) ? entries.length : 0;
+      }
       case "create_managed_agent":
         return handleCreateManagedAgent(
           payload as Parameters<typeof handleCreateManagedAgent>[0],

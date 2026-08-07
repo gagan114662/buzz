@@ -1,5 +1,12 @@
 import * as React from "react";
-import { AlertTriangle, Brain, ChevronDown, RefreshCw } from "lucide-react";
+import {
+  AlertTriangle,
+  Brain,
+  ChevronDown,
+  RefreshCw,
+  Search,
+  Trash2,
+} from "lucide-react";
 import { toast } from "sonner";
 
 import { useAgentMemoryGraph } from "@/features/agent-memory/hooks";
@@ -9,6 +16,7 @@ import {
   type MemoryProposal,
 } from "@/features/agent-memory/lib/memoryProposal";
 import {
+  deleteAgentMemories,
   type EngramEntry,
   reviewMemoryProposal,
 } from "@/shared/api/tauriEngrams";
@@ -141,7 +149,12 @@ function MemorySectionForOwner({ agentPubkey }: { agentPubkey: string }) {
             memories={query.data.memories}
             onReviewed={() => query.refetch()}
           />
-          <MemoryGraphView graph={graph} truncated={query.data.truncated} />
+          <MemoryGraphView
+            agentPubkey={agentPubkey}
+            graph={graph}
+            onDeleted={() => query.refetch()}
+            truncated={query.data.truncated}
+          />
         </>
       ) : null}
     </section>
@@ -367,14 +380,20 @@ function MemoryStaleErrorBanner({ onRetry }: { onRetry: () => void }) {
 }
 
 function MemoryGraphView({
+  agentPubkey,
   graph,
+  onDeleted,
   truncated,
 }: {
+  agentPubkey: string;
   graph: NonNullable<ReturnType<typeof useAgentMemoryGraph>["graph"]>;
+  onDeleted: () => Promise<unknown>;
   truncated: boolean;
 }) {
   const { rootedTree, orphans, dangling } = graph;
   const [showAllEntries, setShowAllEntries] = React.useState(false);
+  const [query, setQuery] = React.useState("");
+  const [deleting, setDeleting] = React.useState(false);
   const danglingSlugs = React.useMemo(
     () => new Set(dangling.map((d) => d.slug)),
     [dangling],
@@ -402,13 +421,99 @@ function MemoryGraphView({
     ...orphans,
   ];
   const entries = [...(core ? [core] : []), ...memories];
-  const hasMoreEntries = entries.length > MEMORY_LIST_PREVIEW_LIMIT;
+  const normalizedQuery = query.trim().toLowerCase();
+  const filteredEntries = (
+    normalizedQuery
+      ? entries.filter((entry) =>
+          `${entry.slug} ${entry.body}`.toLowerCase().includes(normalizedQuery),
+        )
+      : entries
+  ).sort((left, right) => right.createdAt - left.createdAt);
+  const hasMoreEntries = filteredEntries.length > MEMORY_LIST_PREVIEW_LIMIT;
   const visibleEntries = showAllEntries
-    ? entries
-    : entries.slice(0, MEMORY_LIST_PREVIEW_LIMIT);
+    ? filteredEntries
+    : filteredEntries.slice(0, MEMORY_LIST_PREVIEW_LIMIT);
+  const forgettableResults = filteredEntries.filter(
+    (entry) => entry.slug !== "core" && entry.slug.startsWith("mem/"),
+  );
+
+  const forget = async (candidates: EngramEntry[], label: string) => {
+    if (candidates.length === 0 || deleting) return;
+    const selected = candidates.slice(0, 100);
+    if (
+      !window.confirm(
+        `Forget ${selected.length} ${label}? They will be removed from the agent's active memory.`,
+      )
+    )
+      return;
+    setDeleting(true);
+    try {
+      const deleted = await deleteAgentMemories(agentPubkey, selected);
+      toast.success(
+        `Forgot ${deleted} ${deleted === 1 ? "memory" : "memories"}`,
+      );
+      await onDeleted();
+    } catch (error) {
+      toast.error(
+        error instanceof Error ? error.message : "Memory deletion failed",
+      );
+    } finally {
+      setDeleting(false);
+    }
+  };
+  const thirtyDaysAgo = Math.floor(Date.now() / 1000) - 30 * 24 * 60 * 60;
+  const olderThanThirtyDays = memories.filter(
+    (entry) => entry.createdAt < thirtyDaysAgo,
+  );
 
   return (
     <div className="space-y-3">
+      <div className="flex flex-wrap gap-2">
+        <label className="relative min-w-52 flex-1">
+          <Search className="pointer-events-none absolute left-3 top-2.5 h-4 w-4 text-muted-foreground" />
+          <input
+            aria-label="Search agent memories"
+            className="w-full rounded-xl border border-border bg-background py-2 pl-9 pr-3 text-sm outline-none focus-visible:ring-2 focus-visible:ring-ring"
+            data-testid="agent-memory-search"
+            onChange={(event) => {
+              setQuery(event.target.value);
+              setShowAllEntries(true);
+            }}
+            placeholder="Search memory and timeline"
+            type="search"
+            value={query}
+          />
+        </label>
+        {normalizedQuery && forgettableResults.length > 0 ? (
+          <Button
+            data-testid="agent-memory-forget-results"
+            disabled={deleting}
+            onClick={() => forget(forgettableResults, "matching memories")}
+            size="sm"
+            type="button"
+            variant="outline"
+          >
+            <Trash2 className="mr-1.5 h-4 w-4" />
+            Forget results
+          </Button>
+        ) : null}
+        {!normalizedQuery && olderThanThirtyDays.length > 0 ? (
+          <Button
+            data-testid="agent-memory-forget-old"
+            disabled={deleting}
+            onClick={() =>
+              forget(olderThanThirtyDays, "memories older than 30 days")
+            }
+            size="sm"
+            type="button"
+            variant="outline"
+          >
+            <Trash2 className="mr-1.5 h-4 w-4" />
+            Forget 30+ days
+          </Button>
+        ) : null}
+      </div>
+
       {!core && memories.length > 0 ? (
         <p
           className="text-xs italic text-muted-foreground"
@@ -429,9 +534,15 @@ function MemoryGraphView({
         ))}
       </div>
 
+      {filteredEntries.length === 0 ? (
+        <p className="rounded-2xl bg-muted/40 px-4 py-6 text-center text-sm text-muted-foreground">
+          No memories match “{query.trim()}”.
+        </p>
+      ) : null}
+
       {hasMoreEntries && !showAllEntries ? (
         <MemoryShowMoreButton
-          count={entries.length}
+          count={filteredEntries.length}
           onClick={() => setShowAllEntries(true)}
           truncated={truncated}
         />
@@ -676,6 +787,15 @@ function MemoryEntryAccordion({
           ) : null}
           <MemorySlugTitle slug={entry.slug} />
         </div>
+        <time
+          className="mt-0.5 block text-2xs text-muted-foreground"
+          dateTime={new Date(entry.createdAt * 1000).toISOString()}
+        >
+          {new Intl.DateTimeFormat(undefined, {
+            dateStyle: "medium",
+            timeStyle: "short",
+          }).format(entry.createdAt * 1000)}
+        </time>
         <div
           className={cn(
             "mt-1 text-xs leading-5 text-foreground/70",

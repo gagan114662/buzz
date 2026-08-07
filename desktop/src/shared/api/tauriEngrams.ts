@@ -68,3 +68,16 @@ export async function reviewMemoryProposal(
 ): Promise<void> {
   await invokeTauri("review_agent_memory_proposal", { input });
 }
+
+export async function deleteAgentMemories(
+  agentPubkey: string,
+  entries: EngramEntry[],
+): Promise<number> {
+  return invokeTauri<number>("delete_agent_memories", {
+    agentPubkey,
+    entries: entries.map((entry) => ({
+      slug: entry.slug,
+      previousCreatedAt: entry.createdAt,
+    })),
+  });
+}

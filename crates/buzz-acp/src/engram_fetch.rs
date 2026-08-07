@@ -167,7 +167,8 @@ pub fn build_recall_section(memories: &[RecallMemory], query: &str) -> Option<St
             let searchable = format!("{} {}", memory.slug, memory.value).to_lowercase();
             let terms = meaningful_terms(&searchable);
             let overlap = query_terms.intersection(&terms).count();
-            if overlap == 0 {
+            let similarity = trigram_similarity(query, &searchable);
+            if overlap == 0 && similarity < 0.18 {
                 return None;
             }
             let coverage = overlap as f64 / query_terms.len() as f64;
@@ -175,7 +176,7 @@ pub fn build_recall_section(memories: &[RecallMemory], query: &str) -> Option<St
             let age_days = newest.saturating_sub(memory.created_at) as f64 / 86_400.0;
             let recency = 1.0 / (1.0 + age_days / 30.0);
             Some((
-                coverage * 10.0 + overlap as f64 + phrase * 4.0 + recency,
+                coverage * 10.0 + overlap as f64 + phrase * 4.0 + similarity * 3.0 + recency,
                 memory,
             ))
         })
@@ -252,6 +253,32 @@ fn meaningful_terms(text: &str) -> HashSet<String> {
         .map(str::to_lowercase)
         .filter(|term| term.len() >= 3 && !STOP.contains(&term.as_str()))
         .collect()
+}
+
+/// A small, fully local similarity vector. Character trigrams let recall find
+/// related word forms (for example, "authenticate" and "authentication")
+/// without sending private memory to an embedding service or downloading a
+/// model. Exact term overlap still carries most of the ranking weight.
+fn trigram_similarity(left: &str, right: &str) -> f64 {
+    fn trigrams(text: &str) -> HashSet<String> {
+        meaningful_terms(text)
+            .into_iter()
+            .flat_map(|term| {
+                let chars: Vec<char> = term.chars().collect();
+                (0..chars.len().saturating_sub(2))
+                    .map(move |index| chars[index..index + 3].iter().collect())
+                    .collect::<Vec<String>>()
+            })
+            .collect()
+    }
+
+    let left = trigrams(left);
+    let right = trigrams(right);
+    if left.is_empty() || right.is_empty() {
+        return 0.0;
+    }
+    let shared = left.intersection(&right).count() as f64;
+    shared / ((left.len() as f64 * right.len() as f64).sqrt())
 }
 
 /// Query the relay for the core head and decode it. Returns:
@@ -478,6 +505,18 @@ mod tests {
             created_at: 200,
         }];
         assert!(build_recall_section(&memories, "mushroom soup recipe").is_none());
+    }
+
+    #[test]
+    fn recall_matches_related_word_forms_without_exact_term_overlap() {
+        let memories = vec![RecallMemory {
+            slug: "mem/security".into(),
+            value: "Authentication requires the owner's passkey.".into(),
+            created_at: 200,
+        }];
+        let section = build_recall_section(&memories, "How do we authenticate owners?")
+            .expect("local similarity should match related word forms");
+        assert!(section.contains("mem/security"));
     }
 
     #[test]

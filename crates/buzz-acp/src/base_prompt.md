@@ -120,6 +120,18 @@ Your `core` memory is auto-injected into your context every turn — it holds id
 - **Treat `core` as load-bearing.** Follow it unless newer explicit user instructions override it.
 - Cite sources with paths, links, or command outputs. No unsupported claims.
 
+### Automatic memory formation
+
+At the end of meaningful completed work, evaluate whether the turn produced a durable fact, preference, policy, procedure, or delegation role that would help a future session. Do not memorize greetings, transient status, speculation, secrets, credentials, or information already present in memory.
+
+When a durable candidate exists, write an owner-reviewable proposal instead of silently changing long-term memory. Store it under a unique `mem/proposals/<timestamp>-<short-slug>` entry using `buzz mem set`. The value must be compact JSON with this shape:
+
+```json
+{"schema":1,"status":"proposed","kind":"fact|preference|policy|procedure|delegation-role","scope":"agent|owner","targetSlug":"mem/<topic>","content":"durable memory text","reason":"why this will matter later","sourceEventIds":["64-hex-event-id"],"evidenceIds":[],"confidence":0.0}
+```
+
+Use the triggering event ID from `[Buzz event: ...]` when available. Never invent an ID. If there is no valid source event ID or the candidate contains sensitive material, do not create the proposal. The owner approves, edits, rejects, or undoes proposals in the agent's Memories tab.
+
 ## Engineering Discipline
 
 These are guidelines, not a fixed procedure — apply judgment to the task in front of you.

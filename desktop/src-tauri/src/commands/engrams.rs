@@ -43,6 +43,13 @@ pub struct ReviewMemoryProposalInput {
     previous_value: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MemoryDeletionInput {
+    slug: String,
+    previous_created_at: u64,
+}
+
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct MemoryProposalDocument {
@@ -428,10 +435,119 @@ pub async fn review_agent_memory_proposal(
     Ok(())
 }
 
+/// Forget one or more active cold-memory entries by publishing encrypted
+/// NIP-AE tombstones. Historical ciphertext may remain on the relay. Core memory is deliberately excluded; clearing identity
+/// requires the explicit core-edit flow. Writes require local custody of the
+/// agent signing key and are capped to keep one UI action bounded.
+#[tauri::command]
+pub async fn delete_agent_memories(
+    agent_pubkey: String,
+    entries: Vec<MemoryDeletionInput>,
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<u32, String> {
+    let unique = validate_memory_deletions(entries)?;
+
+    let records = load_managed_agents(&app)?;
+    let record = records
+        .iter()
+        .find(|record| record.pubkey.eq_ignore_ascii_case(&agent_pubkey))
+        .ok_or_else(|| "memories can only be deleted for a locally managed agent".to_string())?;
+    let agent_keys = nostr::Keys::parse(record.private_key_nsec.trim())
+        .map_err(|_| "managed agent signing key is unavailable".to_string())?;
+    if !agent_keys
+        .public_key()
+        .to_hex()
+        .eq_ignore_ascii_case(&agent_pubkey)
+    {
+        return Err("managed agent signing key does not match the memory agent".into());
+    }
+    let (owner_pubkey, now) = {
+        let keys = state.keys.lock().map_err(|e| e.to_string())?;
+        (keys.public_key(), nostr::Timestamp::now().as_secs())
+    };
+
+    let mut deleted = 0u32;
+    for (slug, previous_created_at) in unique {
+        let event = buzz_core_pkg::engram::build_event(
+            &agent_keys,
+            &owner_pubkey,
+            &Body::Memory { slug, value: None },
+            now.max(previous_created_at.saturating_add(1)),
+        )
+        .map_err(|e| e.to_string())?;
+        crate::relay::submit_signed_event_with_keys(
+            &event,
+            &state,
+            &agent_keys,
+            record.auth_tag.as_deref(),
+        )
+        .await?;
+        deleted = deleted.saturating_add(1);
+    }
+    Ok(deleted)
+}
+
+fn validate_memory_deletions(
+    entries: Vec<MemoryDeletionInput>,
+) -> Result<std::collections::BTreeMap<String, u64>, String> {
+    if entries.is_empty() || entries.len() > 100 {
+        return Err("memory deletion requires between 1 and 100 entries".into());
+    }
+    let mut normalized = std::collections::BTreeMap::new();
+    for entry in entries {
+        if !entry.slug.starts_with("mem/") || entry.slug == "mem/" || entry.slug.len() > 256 {
+            return Err(format!("invalid memory slug: {}", entry.slug));
+        }
+        normalized
+            .entry(entry.slug)
+            .and_modify(|timestamp: &mut u64| {
+                *timestamp = (*timestamp).max(entry.previous_created_at)
+            })
+            .or_insert(entry.previous_created_at);
+    }
+    Ok(normalized)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use nostr::{EventBuilder, Keys, Kind, Tag};
+
+    #[test]
+    fn memory_deletion_slugs_are_bounded_valid_and_deduplicated() {
+        let slugs = validate_memory_deletions(vec![
+            MemoryDeletionInput {
+                slug: "mem/preferences".into(),
+                previous_created_at: 10,
+            },
+            MemoryDeletionInput {
+                slug: "mem/preferences".into(),
+                previous_created_at: 20,
+            },
+            MemoryDeletionInput {
+                slug: "mem/project".into(),
+                previous_created_at: 30,
+            },
+        ])
+        .expect("valid memory slugs");
+        assert_eq!(slugs.len(), 2);
+        assert_eq!(slugs.get("mem/preferences"), Some(&20));
+        assert_eq!(slugs.get("mem/project"), Some(&30));
+
+        let deletion = |slug: String| MemoryDeletionInput {
+            slug,
+            previous_created_at: 0,
+        };
+        assert!(validate_memory_deletions(Vec::new()).is_err());
+        assert!(validate_memory_deletions(vec![deletion("core".into())]).is_err());
+        assert!(validate_memory_deletions(vec![deletion("mem/".into())]).is_err());
+        assert!(validate_memory_deletions(vec![deletion("mem/x".repeat(101))]).is_err());
+        assert!(validate_memory_deletions(
+            (0..101).map(|i| deletion(format!("mem/{i}"))).collect()
+        )
+        .is_err());
+    }
 
     /// Build a `kind:0` carrying a valid NIP-OA `auth` tag declaring `owner`
     /// as the owner of `agent`. Mirrors the helper in `identity_archive`'s
