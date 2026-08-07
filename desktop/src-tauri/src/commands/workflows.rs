@@ -47,6 +47,18 @@ pub struct WorkflowSaveWire {
     pub webhook_secret: Option<String>,
 }
 
+/// Response returned after the relay accepts a manual workflow trigger.
+/// Mirrors `RawTriggerWorkflowResponse` in the frontend.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct TriggerWorkflowWire {
+    /// Durable workflow-run identifier minted by the relay.
+    pub run_id: String,
+    /// Workflow definition that owns the new run.
+    pub workflow_id: String,
+    /// Initial run state at relay acknowledgement time.
+    pub status: String,
+}
+
 // ── Reads ────────────────────────────────────────────────────────────────────
 
 #[tauri::command]
@@ -245,7 +257,9 @@ pub async fn trigger_workflow(
 ) -> Result<Value, String> {
     let builder = events::build_workflow_trigger(&workflow_id)?;
     let result = submit_event(builder, &state).await?;
-    Ok(serde_json::json!({ "event_id": result.event_id }))
+    let response = trigger_workflow_response(&workflow_id, &result.message)?;
+    serde_json::to_value(response)
+        .map_err(|e| format!("trigger response serialization failed: {e}"))
 }
 
 // ── Approvals ────────────────────────────────────────────────────────────────
@@ -299,6 +313,28 @@ fn now_secs() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or_default()
+}
+
+fn trigger_workflow_response(
+    workflow_id: &str,
+    relay_message: &str,
+) -> Result<TriggerWorkflowWire, String> {
+    let payload = parse_command_response::<Value>(relay_message)?;
+    let run_id = payload
+        .get("run_id")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| "trigger response missing run_id".to_string())?;
+
+    uuid::Uuid::parse_str(run_id).map_err(|_| "trigger response has invalid run_id".to_string())?;
+
+    Ok(TriggerWorkflowWire {
+        run_id: run_id.to_string(),
+        workflow_id: workflow_id.to_string(),
+        // The relay acknowledges immediately after creating the durable run;
+        // execution continues asynchronously from its initial pending state.
+        status: "pending".to_string(),
+    })
 }
 
 /// First value of the tag whose name matches `name` (e.g. `d`, `h`).

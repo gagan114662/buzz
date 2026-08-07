@@ -189,6 +189,35 @@ fn workflow_wire_serializes_with_snake_case_keys() {
 }
 
 #[test]
+fn trigger_response_preserves_the_relay_run_id_and_frontend_shape() {
+    let run_id = "33333333-3333-3333-3333-333333333333";
+    let response = trigger_workflow_response(WF, &format!(r#"response:{{"run_id":"{run_id}"}}"#))
+        .expect("parse trigger response");
+
+    assert_eq!(response.run_id, run_id);
+    assert_eq!(response.workflow_id, WF);
+    assert_eq!(response.status, "pending");
+
+    let value = serde_json::to_value(response).expect("serialize trigger response");
+    assert_eq!(value.get("run_id").and_then(Value::as_str), Some(run_id));
+    assert_eq!(value.get("workflow_id").and_then(Value::as_str), Some(WF));
+    assert_eq!(value.get("status").and_then(Value::as_str), Some("pending"));
+    assert!(value.get("event_id").is_none());
+}
+
+#[test]
+fn trigger_response_rejects_missing_or_invalid_run_ids() {
+    assert_eq!(
+        trigger_workflow_response(WF, r#"response:{}"#).unwrap_err(),
+        "trigger response missing run_id"
+    );
+    assert_eq!(
+        trigger_workflow_response(WF, r#"response:{"run_id":"not-a-uuid"}"#).unwrap_err(),
+        "trigger response has invalid run_id"
+    );
+}
+
+#[test]
 fn runs_and_approvals_serialize_to_bare_empty_array() {
     // Regression guard for the crash class this fix closed. The frontend
     // wrappers `getWorkflowRuns` / `getRunApprovals` do `raw.map(...)`, so the
