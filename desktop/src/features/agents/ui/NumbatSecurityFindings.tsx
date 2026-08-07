@@ -11,6 +11,7 @@ import {
   type GuardianCase,
   type GuardianSuppression,
   type NumbatFinding,
+  updateGuardianCaseStatus,
 } from "@/shared/api/tauriNumbat";
 import { Badge } from "@/shared/ui/badge";
 import { Button } from "@/shared/ui/button";
@@ -77,12 +78,79 @@ export function NumbatSecurityFindings({
         </div>
       ) : null}
       {cases.length > 0 ? (
-        <p
-          className="text-xs text-muted-foreground"
-          data-testid="guardian-case-count"
-        >
-          {cases.length} local investigation case{cases.length === 1 ? "" : "s"}
-        </p>
+        <div className="space-y-2" data-testid="guardian-case-list">
+          <p
+            className="text-xs text-muted-foreground"
+            data-testid="guardian-case-count"
+          >
+            {cases.length} local investigation case
+            {cases.length === 1 ? "" : "s"}
+          </p>
+          {cases.map((item) => {
+            const nextStatus =
+              item.status === "new"
+                ? "triaged"
+                : item.status === "triaged" || item.status === "reopened"
+                  ? "investigating"
+                  : item.status === "investigating"
+                    ? "resolved"
+                    : item.status === "resolved"
+                      ? "closed"
+                      : item.status === "closed"
+                        ? "reopened"
+                        : null;
+            return (
+              <div
+                className="flex flex-wrap items-center justify-between gap-2 rounded-md border border-border/70 px-3 py-2"
+                data-case-id={item.caseId}
+                key={item.caseId}
+              >
+                <div className="min-w-0">
+                  <p className="truncate text-xs font-medium">{item.title}</p>
+                  <p className="text-xs text-muted-foreground">
+                    {item.status.replaceAll("_", " ")} ·{" "}
+                    {item.findingIds.length} finding
+                    {item.findingIds.length === 1 ? "" : "s"}
+                  </p>
+                </div>
+                {nextStatus ? (
+                  <Button
+                    data-testid="guardian-advance-case"
+                    onClick={() => {
+                      void updateGuardianCaseStatus(item.caseId, nextStatus)
+                        .then((updated) => {
+                          setCases((current) =>
+                            current.map((candidate) =>
+                              candidate.caseId === updated.caseId
+                                ? updated
+                                : candidate,
+                            ),
+                          );
+                          toast.success(
+                            `Case moved to ${updated.status.replaceAll("_", " ")}`,
+                          );
+                        })
+                        .catch((cause: unknown) =>
+                          toast.error(
+                            cause instanceof Error
+                              ? cause.message
+                              : "Could not update case",
+                          ),
+                        );
+                    }}
+                    size="xs"
+                    type="button"
+                    variant="outline"
+                  >
+                    {nextStatus === "reopened"
+                      ? "Reopen"
+                      : `Mark ${nextStatus.replaceAll("_", " ")}`}
+                  </Button>
+                ) : null}
+              </div>
+            );
+          })}
+        </div>
       ) : null}
       {findings
         .slice()
