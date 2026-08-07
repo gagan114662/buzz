@@ -66,4 +66,38 @@ pub trait ActionSink: Send + Sync {
         text: &str,
         author_pubkey: &str,
     ) -> Pin<Box<dyn Future<Output = Result<String, ActionSinkError>> + Send + '_>>;
+
+    /// Publish an actionable approval-request event after the gate is durable.
+    #[allow(clippy::too_many_arguments)]
+    fn publish_approval_request(
+        &self,
+        community_id: CommunityId,
+        channel_id: &str,
+        workflow_id: &str,
+        run_id: &str,
+        step_id: &str,
+        token_hash: &str,
+        approver_spec: &str,
+        message: &str,
+        expires_at: i64,
+        author_pubkey: &str,
+    ) -> Pin<Box<dyn Future<Output = Result<String, ActionSinkError>> + Send + '_>> {
+        let _ = (
+            community_id,
+            channel_id,
+            workflow_id,
+            run_id,
+            step_id,
+            token_hash,
+            approver_spec,
+            message,
+            expires_at,
+            author_pubkey,
+        );
+        Box::pin(async {
+            Err(ActionSinkError::InvalidInput(
+                "approval request publishing is not supported by this sink".into(),
+            ))
+        })
+    }
 }

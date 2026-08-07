@@ -3825,6 +3825,20 @@ impl Db {
         workflow::create_approval(&self.pool, params).await
     }
 
+    /// Atomically create an approval request and suspend its workflow run.
+    pub async fn suspend_workflow_run_for_approval(
+        &self,
+        params: workflow::CreateApprovalParams<'_>,
+        trace: &serde_json::Value,
+    ) -> Result<()> {
+        workflow::suspend_workflow_run_for_approval(&self.pool, params, trace).await
+    }
+
+    /// Expire pending approval gates and cancel their still-waiting runs.
+    pub async fn expire_pending_workflow_approvals(&self) -> Result<u64> {
+        workflow::expire_pending_workflow_approvals(&self.pool).await
+    }
+
     /// Fetch an approval by raw token.
     pub async fn get_approval(
         &self,

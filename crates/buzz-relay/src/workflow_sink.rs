@@ -8,7 +8,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Weak};
 
-use buzz_core::kind::KIND_STREAM_MESSAGE;
+use buzz_core::kind::{KIND_STREAM_MESSAGE, KIND_WORKFLOW_APPROVAL_REQUESTED};
 use buzz_core::tenant::CommunityId;
 use buzz_workflow::action_sink::{ActionSink, ActionSinkError};
 use chrono::Utc;
@@ -360,6 +360,103 @@ impl ActionSink for RelayActionSink {
             }
 
             Ok(event_id_hex)
+        })
+    }
+
+    fn publish_approval_request(
+        &self,
+        community_id: CommunityId,
+        channel_id: &str,
+        workflow_id: &str,
+        run_id: &str,
+        step_id: &str,
+        token_hash: &str,
+        approver_spec: &str,
+        message: &str,
+        expires_at: i64,
+        author_pubkey: &str,
+    ) -> Pin<Box<dyn Future<Output = Result<String, ActionSinkError>> + Send + '_>> {
+        let channel_id = channel_id.to_owned();
+        let workflow_id = workflow_id.to_owned();
+        let run_id = run_id.to_owned();
+        let step_id = step_id.to_owned();
+        let token_hash = token_hash.to_owned();
+        let approver_spec = approver_spec.to_owned();
+        let message = message.to_owned();
+        let author_pubkey = author_pubkey.to_owned();
+
+        Box::pin(async move {
+            let state = self
+                .state
+                .upgrade()
+                .ok_or_else(|| ActionSinkError::Database("relay is shutting down".into()))?;
+            let host = state
+                .db
+                .lookup_community_host(community_id)
+                .await
+                .map_err(|e| ActionSinkError::Database(e.to_string()))?
+                .ok_or_else(|| {
+                    ActionSinkError::Database("workflow community has no host".into())
+                })?;
+            let tenant = buzz_core::tenant::TenantContext::resolved(community_id, host);
+            let channel_uuid = Uuid::parse_str(&channel_id)
+                .map_err(|e| ActionSinkError::InvalidInput(format!("invalid channel UUID: {e}")))?;
+            let mut tags = vec![
+                Tag::parse(["h", channel_id.as_str()])
+                    .map_err(|e| ActionSinkError::EventBuild(format!("h tag: {e}")))?,
+                Tag::parse(["d", token_hash.as_str()])
+                    .map_err(|e| ActionSinkError::EventBuild(format!("d tag: {e}")))?,
+                Tag::parse(["w", workflow_id.as_str()])
+                    .map_err(|e| ActionSinkError::EventBuild(format!("w tag: {e}")))?,
+                Tag::parse(["r", run_id.as_str()])
+                    .map_err(|e| ActionSinkError::EventBuild(format!("r tag: {e}")))?,
+                Tag::parse(["s", step_id.as_str()])
+                    .map_err(|e| ActionSinkError::EventBuild(format!("s tag: {e}")))?,
+                Tag::parse(["p", author_pubkey.as_str()])
+                    .map_err(|e| ActionSinkError::EventBuild(format!("p tag: {e}")))?,
+                Tag::parse(["expiration", expires_at.to_string().as_str()])
+                    .map_err(|e| ActionSinkError::EventBuild(format!("expiration tag: {e}")))?,
+            ];
+            if approver_spec.len() == 64
+                && approver_spec.chars().all(|c| c.is_ascii_hexdigit())
+                && approver_spec != author_pubkey
+            {
+                tags.push(
+                    Tag::parse(["p", approver_spec.as_str()])
+                        .map_err(|e| ActionSinkError::EventBuild(format!("approver p tag: {e}")))?,
+                );
+            }
+            let content = serde_json::json!({
+                "workflow_id": workflow_id,
+                "run_id": run_id,
+                "step_id": step_id,
+                "message": message,
+                "expires_at": expires_at,
+            })
+            .to_string();
+            let event =
+                EventBuilder::new(Kind::from(KIND_WORKFLOW_APPROVAL_REQUESTED as u16), content)
+                    .tags(tags)
+                    .sign_with_keys(&state.relay_keypair)
+                    .map_err(|e| ActionSinkError::EventBuild(format!("signing: {e}")))?;
+            let event_id = event.id.to_hex();
+            let (stored, inserted) = state
+                .db
+                .insert_event(tenant.community(), &event, Some(channel_uuid))
+                .await
+                .map_err(|e| ActionSinkError::Database(e.to_string()))?;
+            if inserted {
+                let _ = dispatch_persistent_event(
+                    &tenant,
+                    &state,
+                    &stored,
+                    KIND_WORKFLOW_APPROVAL_REQUESTED,
+                    author_pubkey.as_str(),
+                    None,
+                )
+                .await;
+            }
+            Ok(event_id)
         })
     }
 }

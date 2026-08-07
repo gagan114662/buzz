@@ -1188,6 +1188,10 @@ async fn execute_steps(
                     run_id = %run_id, step = %step.id,
                     "Step suspended — awaiting approval (token: <redacted>)"
                 );
+                trace.push(serde_json::json!({
+                    "step_id": step.id,
+                    "status": "waiting_approval",
+                }));
                 // Return the token and current state so the caller can persist the
                 // approval record and update the run's execution trace.
                 return Ok(ExecutionResult {

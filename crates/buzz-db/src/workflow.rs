@@ -30,7 +30,8 @@ pub const LIST_MAX_LIMIT: i64 = 1000;
 ///
 /// Approval tokens are stored hashed so that a DB read does not expose
 /// the raw token (same pattern as API tokens in buzz-auth).
-fn hash_approval_token(token: &str) -> Vec<u8> {
+/// Hash a raw approval token for safe references outside the database.
+pub fn hash_approval_token(token: &str) -> Vec<u8> {
     Sha256::digest(token.as_bytes()).to_vec()
 }
 
@@ -977,6 +978,95 @@ pub async fn create_approval(pool: &PgPool, params: CreateApprovalParams<'_>) ->
     .await?;
 
     Ok(())
+}
+
+/// Atomically persist an approval request and move its run into the waiting state.
+pub async fn suspend_workflow_run_for_approval(
+    pool: &PgPool,
+    params: CreateApprovalParams<'_>,
+    trace: &serde_json::Value,
+) -> Result<()> {
+    let CreateApprovalParams {
+        community_id,
+        token,
+        workflow_id,
+        run_id,
+        step_id,
+        step_index,
+        approver_spec,
+        expires_at,
+    } = params;
+    let token_hash = hash_approval_token(token);
+    let mut tx = pool.begin().await?;
+
+    sqlx::query(
+        r#"
+        INSERT INTO workflow_approvals
+            (community_id, token, workflow_id, run_id, step_id, step_index, approver_spec, status, expires_at)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, 'pending', $8)
+        "#,
+    )
+    .bind(community_id.as_uuid())
+    .bind(token_hash)
+    .bind(workflow_id)
+    .bind(run_id)
+    .bind(step_id)
+    .bind(step_index)
+    .bind(approver_spec)
+    .bind(expires_at)
+    .execute(&mut *tx)
+    .await?;
+
+    let affected = sqlx::query(
+        r#"
+        UPDATE workflow_runs
+        SET status = 'waiting_approval', current_step = $1,
+            execution_trace = $2, error_message = NULL
+        WHERE community_id = $3 AND id = $4 AND workflow_id = $5
+          AND status = 'running'
+        "#,
+    )
+    .bind(step_index)
+    .bind(trace)
+    .bind(community_id.as_uuid())
+    .bind(run_id)
+    .bind(workflow_id)
+    .execute(&mut *tx)
+    .await?
+    .rows_affected();
+
+    if affected == 0 {
+        return Err(DbError::NotFound(format!("workflow_run {run_id}")));
+    }
+    tx.commit().await?;
+    Ok(())
+}
+
+/// Expire pending approval gates and cancel their still-waiting runs.
+///
+/// Both transitions happen in one statement so a run cannot remain waiting on
+/// an approval that has already become terminal.
+pub async fn expire_pending_workflow_approvals(pool: &PgPool) -> Result<u64> {
+    let result = sqlx::query(
+        r#"
+        WITH expired AS (
+            UPDATE workflow_approvals
+            SET status = 'expired'
+            WHERE status = 'pending' AND expires_at <= NOW()
+            RETURNING community_id, run_id
+        )
+        UPDATE workflow_runs AS runs
+        SET status = 'cancelled', completed_at = NOW(),
+            error_message = 'workflow cancelled: approval request expired'
+        FROM expired
+        WHERE runs.community_id = expired.community_id
+          AND runs.id = expired.run_id
+          AND runs.status = 'waiting_approval'
+        "#,
+    )
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected())
 }
 
 /// Fetch an approval record by raw token.

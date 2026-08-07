@@ -203,6 +203,43 @@ impl WorkflowDef {
                     step.id
                 )));
             }
+
+            if let ActionDef::RequestApproval {
+                from,
+                message,
+                timeout,
+            } = &step.action
+            {
+                let approver = from.trim();
+                if approver != "any"
+                    && !(approver.len() == 64 && approver.chars().all(|c| c.is_ascii_hexdigit()))
+                {
+                    return Err(WorkflowError::InvalidDefinition(format!(
+                        "request_approval step '{}': from must be 'any' or a 64-character public key",
+                        step.id
+                    )));
+                }
+                if message.trim().is_empty() {
+                    return Err(WorkflowError::InvalidDefinition(format!(
+                        "request_approval step '{}': message must not be empty",
+                        step.id
+                    )));
+                }
+                let duration = timeout.as_deref().unwrap_or("24h");
+                let secs = crate::executor::parse_duration_secs(duration).map_err(|_| {
+                    WorkflowError::InvalidDefinition(format!(
+                        "request_approval step '{}': invalid timeout '{duration}'",
+                        step.id
+                    ))
+                })?;
+                const MAX_APPROVAL_TIMEOUT_SECS: u64 = 30 * 24 * 60 * 60;
+                if secs == 0 || secs > MAX_APPROVAL_TIMEOUT_SECS {
+                    return Err(WorkflowError::InvalidDefinition(format!(
+                        "request_approval step '{}': timeout must be between 1 second and 30 days",
+                        step.id
+                    )));
+                }
+            }
         }
 
         if let TriggerDef::Schedule { cron, interval } = &self.trigger {
@@ -357,7 +394,7 @@ mod tests {
             "  - id: topic\n    action: set_channel_topic\n    topic: Status active\n",
             "  - id: react\n    action: add_reaction\n    emoji: white_check_mark\n",
             "  - id: hook\n    action: call_webhook\n    url: https://hooks.example.com/notify\n    method: POST\n",
-            "  - id: approve\n    action: request_approval\n    from: '@manager'\n    message: Approve?\n    timeout: 4h\n",
+            "  - id: approve\n    action: request_approval\n    from: any\n    message: Approve?\n    timeout: 4h\n",
             "  - id: wait\n    action: delay\n    duration: 5m\n",
         );
         let (def, _) = parse_yaml(yaml).expect("parse failed");
@@ -393,7 +430,7 @@ mod tests {
             "name: Deploy Approval\n",
             "trigger:\n  on: webhook\n",
             "steps:\n",
-            "  - id: request\n    action: request_approval\n    from: '@engineering-lead'\n",
+            "  - id: request\n    action: request_approval\n    from: any\n",
             "    message: Approve deploy?\n    timeout: 4h\n",
             "  - id: notify_approved\n    if: 'steps_request_output_approved == true'\n",
             "    action: send_message\n    text: Deploy approved\n",
@@ -402,6 +439,21 @@ mod tests {
         );
         let (def, _) = parse_yaml(yaml).expect("parse failed");
         assert_eq!(def.steps.len(), 3);
+    }
+
+    #[test]
+    fn approval_gate_rejects_unsupported_approver_and_unsafe_timeout() {
+        let role = "name: Gate\ntrigger:\n  on: webhook\nsteps:\n  - id: approve\n    action: request_approval\n    from: '@manager'\n    message: Approve?\n";
+        assert!(parse_yaml(role)
+            .unwrap_err()
+            .to_string()
+            .contains("64-character public key"));
+
+        let excessive = "name: Gate\ntrigger:\n  on: webhook\nsteps:\n  - id: approve\n    action: request_approval\n    from: any\n    message: Approve?\n    timeout: 745h\n";
+        assert!(parse_yaml(excessive)
+            .unwrap_err()
+            .to_string()
+            .contains("between 1 second and 30 days"));
     }
 
     #[test]

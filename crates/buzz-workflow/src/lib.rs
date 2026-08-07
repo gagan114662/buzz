@@ -46,7 +46,7 @@ use std::sync::OnceLock;
 
 use buzz_core::kind::{event_kind_u32, is_workflow_execution_kind, KIND_REACTION};
 use buzz_core::tenant::CommunityId;
-use buzz_db::workflow::RunStatus;
+use buzz_db::workflow::{CreateApprovalParams, RunStatus};
 use buzz_db::Db;
 use chrono::{DateTime, Utc};
 use dashmap::DashMap;
@@ -226,30 +226,100 @@ impl WorkflowEngine {
                 let trace_json = serde_json::Value::Array(full_trace);
                 let step_count = result.step_index as i32;
 
-                if result.approval_token.is_some() {
-                    // Approval gates are not yet implemented (WF-08).
-                    // Fail explicitly rather than creating unreachable WaitingApproval rows.
-                    tracing::warn!(
-                        run_id = %run_id,
-                        step_index = result.step_index,
-                        "Workflow hit approval gate — not yet implemented, marking as failed"
-                    );
-                    if let Err(e) = self
-                        .db
-                        .update_workflow_run(
-                            community_id,
-                            run_id,
-                            RunStatus::Failed,
-                            step_count,
-                            &trace_json,
-                            Some("approval gates not yet implemented — see WF-08"),
-                        )
-                        .await
-                    {
-                        tracing::error!(
-                            run_id = %run_id,
-                            "Failed to update run to Failed (approval gate): {e}"
-                        );
+                if let Some(token) = result.approval_token {
+                    let suspended = async {
+                        let run = self.db.get_workflow_run(community_id, run_id).await?;
+                        let workflow = self.db.get_workflow(community_id, run.workflow_id).await?;
+                        let def: WorkflowDef = serde_json::from_value(workflow.definition.clone())
+                            .map_err(|e| buzz_db::DbError::InvalidData(e.to_string()))?;
+                        let step = def.steps.get(result.step_index).ok_or_else(|| {
+                            buzz_db::DbError::InvalidData(format!(
+                                "approval step index {} is outside workflow definition",
+                                result.step_index
+                            ))
+                        })?;
+                        let ActionDef::RequestApproval {
+                            from,
+                            message,
+                            timeout,
+                        } = &step.action
+                        else {
+                            return Err(buzz_db::DbError::InvalidData(format!(
+                                "step '{}' suspended without request_approval action",
+                                step.id
+                            )));
+                        };
+                        let timeout_secs =
+                            executor::parse_duration_secs(timeout.as_deref().unwrap_or("24h"))
+                                .map_err(|e| buzz_db::DbError::InvalidData(e.to_string()))?;
+                        let expires_at = Utc::now()
+                            + chrono::Duration::seconds(i64::try_from(timeout_secs).map_err(
+                                |_| {
+                                    buzz_db::DbError::InvalidData(
+                                        "approval timeout is too large".into(),
+                                    )
+                                },
+                            )?);
+                        self.db
+                            .suspend_workflow_run_for_approval(
+                                CreateApprovalParams {
+                                    community_id,
+                                    token: &token,
+                                    workflow_id: run.workflow_id,
+                                    run_id,
+                                    step_id: &step.id,
+                                    step_index: step_count,
+                                    approver_spec: from,
+                                    expires_at,
+                                },
+                                &trace_json,
+                            )
+                            .await?;
+
+                        if let Some(channel_id) = workflow.channel_id {
+                            let token_hash = hex::encode(buzz_db::workflow::hash_approval_token(&token));
+                            let owner_pubkey = hex::encode(&workflow.owner_pubkey);
+                            let sink = self.action_sink().map_err(|e| {
+                                buzz_db::DbError::InvalidData(e.to_string())
+                            })?;
+                            if let Err(e) = sink
+                                .publish_approval_request(
+                                    community_id,
+                                    &channel_id.to_string(),
+                                    &run.workflow_id.to_string(),
+                                    &run_id.to_string(),
+                                    &step.id,
+                                    &token_hash,
+                                    from,
+                                    message,
+                                    expires_at.timestamp(),
+                                    &owner_pubkey,
+                                )
+                                .await
+                            {
+                                tracing::error!(
+                                    run_id = %run_id,
+                                    "Approval gate is durable but request event publication failed: {e}"
+                                );
+                            }
+                        }
+                        Ok(())
+                    }
+                    .await;
+
+                    if let Err(e) = suspended {
+                        tracing::error!(run_id = %run_id, "Failed to suspend run for approval: {e}");
+                        let _ = self
+                            .db
+                            .update_workflow_run(
+                                community_id,
+                                run_id,
+                                RunStatus::Failed,
+                                step_count,
+                                &trace_json,
+                                Some(&format!("failed to create approval request: {e}")),
+                            )
+                            .await;
                     }
                 } else {
                     tracing::info!(run_id = %run_id, "Workflow run completed");
@@ -487,6 +557,14 @@ impl WorkflowEngine {
             tokio::time::sleep(std::time::Duration::from_secs(60)).await;
 
             let now = Utc::now();
+
+            match self.db.expire_pending_workflow_approvals().await {
+                Ok(count) if count > 0 => {
+                    tracing::info!(count, "Expired workflow approval gates")
+                }
+                Ok(_) => {}
+                Err(e) => tracing::error!("Approval expiry sweep failed: {e}"),
+            }
 
             let workflows = match self.db.list_all_enabled_workflows().await {
                 Ok(wf) => wf,
