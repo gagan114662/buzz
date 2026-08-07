@@ -92,6 +92,43 @@ pub enum RevalidationFailure {
     WallDeadline,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EffectState {
+    Prepared,
+    Pending,
+    Observed,
+    Indeterminate,
+}
+
+impl EffectState {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Prepared => "prepared",
+            Self::Pending => "pending",
+            Self::Observed => "observed",
+            Self::Indeterminate => "indeterminate",
+        }
+    }
+
+    fn parse(value: &str) -> Result<Self, String> {
+        match value {
+            "prepared" => Ok(Self::Prepared),
+            "pending" => Ok(Self::Pending),
+            "observed" => Ok(Self::Observed),
+            "indeterminate" => Ok(Self::Indeterminate),
+            _ => Err("stored durable effect state is invalid".into()),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EffectRecord {
+    pub effect_key: String,
+    pub payload_hash: String,
+    pub state: EffectState,
+    pub receipt_hash: Option<String>,
+}
+
 /// Endpoint-local append-only storage. Relay state is never consulted here.
 pub struct DurableTaskStore<'a> {
     connection: &'a mut Connection,
@@ -117,6 +154,16 @@ impl<'a> DurableTaskStore<'a> {
                    revision_hash TEXT NOT NULL,
                    FOREIGN KEY (task_id, revision)
                      REFERENCES guardian_durable_task_revision(task_id, revision)
+                 );
+                 CREATE TABLE IF NOT EXISTS guardian_durable_effect (
+                   effect_key TEXT PRIMARY KEY,
+                   task_id TEXT NOT NULL,
+                   step_id TEXT NOT NULL,
+                   logical_effect_id TEXT NOT NULL,
+                   payload_hash TEXT NOT NULL,
+                   state TEXT NOT NULL,
+                   receipt_hash TEXT,
+                   UNIQUE(task_id, step_id, logical_effect_id)
                  );",
             )
             .map_err(|error| format!("failed to initialize durable task store: {error}"))?;
@@ -226,6 +273,150 @@ impl<'a> DurableTaskStore<'a> {
                     .map_err(|error| format!("stored durable task is corrupt: {error}"))
             })
             .transpose()
+    }
+
+    /// Registers an intended external effect before dispatch. Repeating the
+    /// same canonical payload returns the committed record; reusing the key
+    /// for different bytes is an integrity error.
+    pub fn prepare_effect(
+        &mut self,
+        task_id: &str,
+        step_id: &str,
+        logical_effect_id: &str,
+        payload: &[u8],
+    ) -> Result<EffectRecord, String> {
+        if task_id.is_empty() || step_id.is_empty() || logical_effect_id.is_empty() {
+            return Err("durable effect identity fields must not be empty".into());
+        }
+        let effect_key = logical_effect_key(task_id, step_id, logical_effect_id);
+        let payload_hash = hex::encode(Sha256::digest(payload));
+        if let Some(existing) = self.load_effect(&effect_key)? {
+            if existing.payload_hash != payload_hash {
+                return Err("durable effect key was reused with different payload bytes".into());
+            }
+            return Ok(existing);
+        }
+        self.connection
+            .execute(
+                "INSERT INTO guardian_durable_effect(
+                   effect_key, task_id, step_id, logical_effect_id, payload_hash, state
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, 'prepared')",
+                params![
+                    effect_key,
+                    task_id,
+                    step_id,
+                    logical_effect_id,
+                    payload_hash
+                ],
+            )
+            .map_err(|error| format!("failed to prepare durable effect: {error}"))?;
+        Ok(EffectRecord {
+            effect_key,
+            payload_hash,
+            state: EffectState::Prepared,
+            receipt_hash: None,
+        })
+    }
+
+    /// Must commit before the external side effect is dispatched.
+    pub fn mark_effect_pending(&mut self, effect_key: &str) -> Result<EffectRecord, String> {
+        self.transition_effect(
+            effect_key,
+            EffectState::Prepared,
+            EffectState::Pending,
+            None,
+        )
+    }
+
+    /// Reconciliation records the sink receipt exactly once. A duplicate with
+    /// the same receipt is idempotent; a different receipt is rejected.
+    pub fn observe_effect(
+        &mut self,
+        effect_key: &str,
+        receipt: &[u8],
+    ) -> Result<EffectRecord, String> {
+        let receipt_hash = hex::encode(Sha256::digest(receipt));
+        let current = self
+            .load_effect(effect_key)?
+            .ok_or_else(|| "durable effect does not exist".to_string())?;
+        if current.state == EffectState::Observed {
+            if current.receipt_hash.as_deref() == Some(receipt_hash.as_str()) {
+                return Ok(current);
+            }
+            return Err("durable effect already has a different receipt".into());
+        }
+        if current.state != EffectState::Pending {
+            return Err("only a pending durable effect can be observed".into());
+        }
+        self.transition_effect(
+            effect_key,
+            EffectState::Pending,
+            EffectState::Observed,
+            Some(&receipt_hash),
+        )
+    }
+
+    pub fn mark_effect_indeterminate(&mut self, effect_key: &str) -> Result<EffectRecord, String> {
+        self.transition_effect(
+            effect_key,
+            EffectState::Pending,
+            EffectState::Indeterminate,
+            None,
+        )
+    }
+
+    pub fn load_effect(&self, effect_key: &str) -> Result<Option<EffectRecord>, String> {
+        validate_sha256(effect_key)?;
+        self.connection
+            .query_row(
+                "SELECT payload_hash, state, receipt_hash
+                 FROM guardian_durable_effect WHERE effect_key = ?1",
+                [effect_key],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|error| format!("failed to load durable effect: {error}"))?
+            .map(|(payload_hash, state, receipt_hash)| {
+                Ok(EffectRecord {
+                    effect_key: effect_key.to_string(),
+                    payload_hash,
+                    state: EffectState::parse(&state)?,
+                    receipt_hash,
+                })
+            })
+            .transpose()
+    }
+
+    fn transition_effect(
+        &mut self,
+        effect_key: &str,
+        expected: EffectState,
+        next: EffectState,
+        receipt_hash: Option<&str>,
+    ) -> Result<EffectRecord, String> {
+        validate_sha256(effect_key)?;
+        if let Some(hash) = receipt_hash {
+            validate_sha256(hash)?;
+        }
+        let changed = self
+            .connection
+            .execute(
+                "UPDATE guardian_durable_effect SET state = ?2, receipt_hash = ?3
+                 WHERE effect_key = ?1 AND state = ?4",
+                params![effect_key, next.as_str(), receipt_hash, expected.as_str()],
+            )
+            .map_err(|error| format!("failed to transition durable effect: {error}"))?;
+        if changed != 1 {
+            return Err("durable effect state changed concurrently".into());
+        }
+        self.load_effect(effect_key)?
+            .ok_or_else(|| "durable effect disappeared after transition".to_string())
     }
 }
 
@@ -529,6 +720,68 @@ mod tests {
         conflicting.revision = 3;
         conflicting.previous_revision_hash = Some("f".repeat(64));
         assert!(store.compare_and_swap(&first_hash, &conflicting).is_err());
+    }
+
+    #[test]
+    fn effect_journal_is_idempotent_and_rejects_payload_reuse() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        let mut store = DurableTaskStore::new(&mut connection).unwrap();
+        let prepared = store
+            .prepare_effect("task-1", "step-1", "delivery", b"payload")
+            .unwrap();
+        assert_eq!(prepared.state, EffectState::Prepared);
+        assert_eq!(
+            store
+                .prepare_effect("task-1", "step-1", "delivery", b"payload")
+                .unwrap(),
+            prepared
+        );
+        assert!(store
+            .prepare_effect("task-1", "step-1", "delivery", b"changed")
+            .unwrap_err()
+            .contains("different payload"));
+    }
+
+    #[test]
+    fn effect_receipt_is_recorded_exactly_once() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        let mut store = DurableTaskStore::new(&mut connection).unwrap();
+        let prepared = store
+            .prepare_effect("task-1", "step-1", "delivery", b"payload")
+            .unwrap();
+        let pending = store.mark_effect_pending(&prepared.effect_key).unwrap();
+        assert_eq!(pending.state, EffectState::Pending);
+        let observed = store
+            .observe_effect(&prepared.effect_key, b"receipt")
+            .unwrap();
+        assert_eq!(observed.state, EffectState::Observed);
+        assert_eq!(
+            store
+                .observe_effect(&prepared.effect_key, b"receipt")
+                .unwrap(),
+            observed
+        );
+        assert!(store
+            .observe_effect(&prepared.effect_key, b"other receipt")
+            .is_err());
+    }
+
+    #[test]
+    fn indeterminate_effect_cannot_be_blindly_retried() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        let mut store = DurableTaskStore::new(&mut connection).unwrap();
+        let prepared = store
+            .prepare_effect("task-1", "step-1", "delivery", b"payload")
+            .unwrap();
+        store.mark_effect_pending(&prepared.effect_key).unwrap();
+        let waiting = store
+            .mark_effect_indeterminate(&prepared.effect_key)
+            .unwrap();
+        assert_eq!(waiting.state, EffectState::Indeterminate);
+        assert!(store.mark_effect_pending(&prepared.effect_key).is_err());
+        assert!(store
+            .observe_effect(&prepared.effect_key, b"unproven")
+            .is_err());
     }
 
     fn snapshot(value: &DurableTaskCore) -> RevalidationSnapshot {
