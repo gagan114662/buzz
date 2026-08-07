@@ -161,3 +161,12 @@ export function cancelGuardianSuppression(
     input: { suppressionId, reason },
   });
 }
+
+export function saveGuardianCaseBundle(
+  caseId: string,
+  profile: "redacted" | "regression",
+): Promise<boolean> {
+  return invokeTauri<boolean>("save_guardian_case_bundle", {
+    input: { caseId, profile },
+  });
+}

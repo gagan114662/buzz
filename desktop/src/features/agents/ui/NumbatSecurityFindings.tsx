@@ -9,6 +9,7 @@ import {
   createGuardianSuppression,
   listGuardianCases,
   listGuardianSuppressions,
+  saveGuardianCaseBundle,
   type GuardianCase,
   type GuardianSuppression,
   type NumbatFinding,
@@ -156,6 +157,48 @@ export function NumbatSecurityFindings({
                       : `Mark ${nextStatus.replaceAll("_", " ")}`}
                   </Button>
                 ) : null}
+                <Button
+                  data-testid="guardian-export-redacted-case"
+                  onClick={() => {
+                    void saveGuardianCaseBundle(item.caseId, "redacted")
+                      .then((saved) => {
+                        if (saved) toast.success("Redacted case bundle saved");
+                      })
+                      .catch((cause: unknown) =>
+                        toast.error(
+                          cause instanceof Error
+                            ? cause.message
+                            : "Could not export case",
+                        ),
+                      );
+                  }}
+                  size="xs"
+                  type="button"
+                  variant="outline"
+                >
+                  Export redacted
+                </Button>
+                <Button
+                  data-testid="guardian-export-regression-case"
+                  onClick={() => {
+                    void saveGuardianCaseBundle(item.caseId, "regression")
+                      .then((saved) => {
+                        if (saved) toast.success("Regression fixture saved");
+                      })
+                      .catch((cause: unknown) =>
+                        toast.error(
+                          cause instanceof Error
+                            ? cause.message
+                            : "Could not export fixture",
+                        ),
+                      );
+                  }}
+                  size="xs"
+                  type="button"
+                  variant="outline"
+                >
+                  Export fixture
+                </Button>
               </div>
             );
           })}

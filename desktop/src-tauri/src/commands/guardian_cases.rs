@@ -1,4 +1,7 @@
-use std::path::PathBuf;
+use std::{
+    io::{Cursor, Read as _, Write as _},
+    path::PathBuf,
+};
 
 use chrono::Utc;
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
@@ -11,6 +14,7 @@ use crate::{app_state::AppState, managed_agents::managed_agents_base_dir};
 use super::numbat_findings::NumbatFindingProjection;
 
 const CASE_SCHEMA_VERSION: &str = "guardian.case/v1";
+const EXPORT_SCHEMA_VERSION: &str = "guardian.case-export/v1";
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -64,6 +68,29 @@ pub struct CreateGuardianSuppressionInput {
 pub struct CancelGuardianSuppressionInput {
     suppression_id: String,
     reason: String,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ExportGuardianCaseInput {
+    case_id: String,
+    profile: String,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ImportGuardianCaseInput {
+    bytes: Vec<u8>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GuardianCaseImportPreview {
+    schema_version: String,
+    profile: String,
+    case_id: String,
+    file_count: usize,
+    verified: bool,
 }
 
 fn store_path(app: &AppHandle) -> Result<PathBuf, String> {
@@ -146,6 +173,16 @@ fn initialize(connection: &Connection) -> Result<(), String> {
                expires_at TEXT NOT NULL,
                status TEXT NOT NULL,
                previous_version_hash TEXT
+             );
+             CREATE TABLE IF NOT EXISTS guardian_export (
+               export_id TEXT PRIMARY KEY,
+               case_id TEXT NOT NULL,
+               profile TEXT NOT NULL,
+               manifest_hash TEXT NOT NULL,
+               destination_kind TEXT NOT NULL,
+               created_by TEXT NOT NULL,
+               created_at TEXT NOT NULL,
+               result TEXT NOT NULL
              );",
         )
         .map_err(|error| format!("failed to initialize Guardian case storage: {error}"))
@@ -454,6 +491,40 @@ pub fn list_guardian_cases(
         })
     })
     .collect()
+}
+
+fn read_case_projection(
+    connection: &Connection,
+    case_id: &str,
+) -> Result<GuardianCaseProjection, String> {
+    let row: (String, String, String, String, String, String, String) = connection
+        .query_row(
+            "SELECT case_id, title, status, severity, finding_ids_json, opened_at, updated_at
+             FROM guardian_case WHERE case_id = ?1",
+            [case_id],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                ))
+            },
+        )
+        .map_err(|_| "Guardian case does not exist".to_string())?;
+    Ok(GuardianCaseProjection {
+        case_id: row.0,
+        title: row.1,
+        status: row.2,
+        severity: row.3,
+        finding_ids: serde_json::from_str(&row.4)
+            .map_err(|error| format!("stored Guardian case is corrupt: {error}"))?,
+        opened_at: row.5,
+        updated_at: row.6,
+    })
 }
 
 #[tauri::command]
@@ -765,6 +836,230 @@ pub fn cancel_guardian_suppression(
     })
 }
 
+fn zip_bundle(files: &[(String, Vec<u8>)], manifest: &[u8]) -> Result<Vec<u8>, String> {
+    let mut writer = zip::ZipWriter::new(Cursor::new(Vec::new()));
+    let options = zip::write::SimpleFileOptions::default()
+        .compression_method(zip::CompressionMethod::Deflated)
+        .unix_permissions(0o600);
+    writer
+        .start_file("manifest.json", options)
+        .map_err(|error| format!("failed to start Guardian bundle manifest: {error}"))?;
+    writer
+        .write_all(manifest)
+        .map_err(|error| format!("failed to write Guardian bundle manifest: {error}"))?;
+    for (name, contents) in files {
+        writer
+            .start_file(name, options)
+            .map_err(|error| format!("failed to start Guardian bundle entry: {error}"))?;
+        writer
+            .write_all(contents)
+            .map_err(|error| format!("failed to write Guardian bundle entry: {error}"))?;
+    }
+    writer
+        .finish()
+        .map(|cursor| cursor.into_inner())
+        .map_err(|error| format!("failed to finish Guardian bundle: {error}"))
+}
+
+#[tauri::command]
+pub fn export_guardian_case_bundle(
+    app: AppHandle,
+    input: ExportGuardianCaseInput,
+) -> Result<Vec<u8>, String> {
+    validate_identifier(&input.case_id, "case id")?;
+    if !matches!(input.profile.as_str(), "redacted" | "regression") {
+        return Err("full forensic export requires a fresh destination-specific owner confirmation and is not available from this command".into());
+    }
+    let connection = open_store(&app)?;
+    let case = read_case_projection(&connection, &input.case_id)?;
+    let agent_pubkey: String = connection
+        .query_row(
+            "SELECT agent_pubkey FROM guardian_case WHERE case_id = ?1",
+            [&input.case_id],
+            |row| row.get(0),
+        )
+        .map_err(|error| format!("failed to read Guardian case owner: {error}"))?;
+    let mut findings = Vec::new();
+    for finding_id in &case.finding_ids {
+        let finding = connection
+            .query_row(
+                "SELECT finding_id, rule_id, severity, detected_at, evidence_count, projection_hash
+                 FROM guardian_finding WHERE finding_id = ?1",
+                [finding_id],
+                |row| {
+                    Ok(serde_json::json!({
+                        "findingId": row.get::<_, String>(0)?,
+                        "ruleId": row.get::<_, String>(1)?,
+                        "severity": row.get::<_, String>(2)?,
+                        "detectedAt": row.get::<_, String>(3)?,
+                        "evidenceCount": row.get::<_, i64>(4)?,
+                        "projectionHash": row.get::<_, String>(5)?,
+                    }))
+                },
+            )
+            .map_err(|error| format!("failed to read Guardian export finding: {error}"))?;
+        findings.push(finding);
+    }
+    let payload = if input.profile == "redacted" {
+        serde_json::json!({ "case": case, "findings": findings })
+    } else {
+        serde_json::json!({
+            "fixtureSchemaVersion": "guardian.regression-fixture/v1",
+            "expectedFindings": findings.iter().map(|finding| serde_json::json!({
+                "ruleId": finding["ruleId"], "severity": finding["severity"]
+            })).collect::<Vec<_>>()
+        })
+    };
+    let entry_name = if input.profile == "redacted" {
+        "case.json"
+    } else {
+        "fixture.json"
+    };
+    let payload_bytes = serde_json::to_vec_pretty(&payload)
+        .map_err(|error| format!("failed to encode Guardian export payload: {error}"))?;
+    let files = vec![(entry_name.to_string(), payload_bytes)];
+    let file_manifest = files
+        .iter()
+        .map(|(name, bytes)| {
+            serde_json::json!({
+                "name": name, "sha256": hex::encode(Sha256::digest(bytes)), "size": bytes.len()
+            })
+        })
+        .collect::<Vec<_>>();
+    let endpoint_pseudonym = hex::encode(Sha256::digest(format!("guardian-export:{agent_pubkey}")));
+    let manifest_value = serde_json::json!({
+        "schemaVersion": EXPORT_SCHEMA_VERSION,
+        "exporterVersion": env!("CARGO_PKG_VERSION"),
+        "profile": input.profile,
+        "caseId": input.case_id,
+        "sourceEndpointPseudonym": endpoint_pseudonym,
+        "createdAt": Utc::now().to_rfc3339(),
+        "files": file_manifest,
+    });
+    let manifest = serde_json::to_vec_pretty(&manifest_value)
+        .map_err(|error| format!("failed to encode Guardian export manifest: {error}"))?;
+    let manifest_hash = hex::encode(Sha256::digest(&manifest));
+    let bundle = zip_bundle(&files, &manifest)?;
+    let actor = owner_pubkey(&app)?;
+    let export_id = uuid::Uuid::new_v4().to_string();
+    let now = Utc::now().to_rfc3339();
+    connection
+        .execute(
+            "INSERT INTO guardian_export VALUES (?1, ?2, ?3, ?4, 'download', ?5, ?6, 'completed')",
+            params![
+                export_id,
+                input.case_id,
+                input.profile,
+                manifest_hash,
+                actor,
+                now
+            ],
+        )
+        .map_err(|error| format!("failed to record Guardian export: {error}"))?;
+    append_action(
+        &connection,
+        None,
+        Some(&input.case_id),
+        "case_exported",
+        &actor,
+        "Owner exported a verified local case bundle",
+        &now,
+    )?;
+    Ok(bundle)
+}
+
+#[tauri::command]
+pub async fn save_guardian_case_bundle(
+    app: AppHandle,
+    input: ExportGuardianCaseInput,
+) -> Result<bool, String> {
+    let bytes = export_guardian_case_bundle(app.clone(), input.clone())?;
+    let filename = format!("guardian-case-{}-{}.zip", input.case_id, input.profile);
+    super::export_util::save_bytes_with_dialog(
+        &app,
+        &filename,
+        "Guardian case bundle",
+        &["zip"],
+        &bytes,
+    )
+    .await
+}
+
+#[tauri::command]
+pub fn import_guardian_case_bundle(
+    input: ImportGuardianCaseInput,
+) -> Result<GuardianCaseImportPreview, String> {
+    if input.bytes.is_empty() || input.bytes.len() > 16 * 1024 * 1024 {
+        return Err("Guardian bundle must be between 1 byte and 16 MiB".into());
+    }
+    let mut archive = zip::ZipArchive::new(Cursor::new(input.bytes))
+        .map_err(|error| format!("invalid Guardian bundle: {error}"))?;
+    if archive.len() < 2 || archive.len() > 16 {
+        return Err("Guardian bundle has an invalid file count".into());
+    }
+    let mut manifest_bytes = Vec::new();
+    archive
+        .by_name("manifest.json")
+        .map_err(|_| "Guardian bundle has no manifest.json".to_string())?
+        .read_to_end(&mut manifest_bytes)
+        .map_err(|error| format!("failed to read Guardian bundle manifest: {error}"))?;
+    let manifest: serde_json::Value = serde_json::from_slice(&manifest_bytes)
+        .map_err(|error| format!("invalid Guardian bundle manifest: {error}"))?;
+    if manifest
+        .get("schemaVersion")
+        .and_then(|value| value.as_str())
+        != Some(EXPORT_SCHEMA_VERSION)
+    {
+        return Err("unsupported Guardian bundle schema".into());
+    }
+    let profile = manifest
+        .get("profile")
+        .and_then(|value| value.as_str())
+        .filter(|value| matches!(*value, "redacted" | "regression"))
+        .ok_or_else(|| "invalid Guardian bundle profile".to_string())?;
+    let case_id = manifest
+        .get("caseId")
+        .and_then(|value| value.as_str())
+        .ok_or_else(|| "Guardian bundle is missing caseId".to_string())?;
+    validate_identifier(case_id, "case id")?;
+    let files = manifest
+        .get("files")
+        .and_then(|value| value.as_array())
+        .ok_or_else(|| "Guardian bundle has no file manifest".to_string())?;
+    if files.len() + 1 != archive.len() {
+        return Err("Guardian bundle contains unmanifested files".into());
+    }
+    for expected in files {
+        let name = expected
+            .get("name")
+            .and_then(|value| value.as_str())
+            .ok_or_else(|| "Guardian bundle file is missing a name".to_string())?;
+        if name.contains('/') || name.contains('\\') || name == "manifest.json" {
+            return Err("Guardian bundle contains an unsafe file name".into());
+        }
+        let expected_hash = expected
+            .get("sha256")
+            .and_then(|value| value.as_str())
+            .ok_or_else(|| "Guardian bundle file is missing a hash".to_string())?;
+        let mut contents = Vec::new();
+        archive
+            .by_name(name)
+            .map_err(|_| format!("Guardian bundle is missing {name}"))?
+            .read_to_end(&mut contents)
+            .map_err(|error| format!("failed to read Guardian bundle entry: {error}"))?;
+        if hex::encode(Sha256::digest(&contents)) != expected_hash {
+            return Err(format!("Guardian bundle hash mismatch for {name}"));
+        }
+    }
+    Ok(GuardianCaseImportPreview {
+        schema_version: EXPORT_SCHEMA_VERSION.into(),
+        profile: profile.into(),
+        case_id: case_id.into(),
+        file_count: files.len(),
+        verified: true,
+    })
+}
+
 fn valid_case_transition(current: &str, next: &str) -> bool {
     matches!(
         (current, next),
@@ -835,5 +1130,41 @@ mod tests {
         assert!(!valid_case_transition("new", "closed"));
         assert!(valid_case_transition("closed", "reopened"));
         assert!(valid_case_transition("investigating", "false_positive"));
+    }
+
+    #[test]
+    fn imported_bundle_verifies_every_manifested_hash() {
+        let payload = br#"{"case":{"caseId":"case-1"}}"#.to_vec();
+        let files = vec![("case.json".to_string(), payload.clone())];
+        let manifest = serde_json::to_vec(&serde_json::json!({
+            "schemaVersion": EXPORT_SCHEMA_VERSION,
+            "profile": "redacted",
+            "caseId": "case-1",
+            "files": [{
+                "name": "case.json",
+                "sha256": hex::encode(Sha256::digest(&payload)),
+                "size": payload.len(),
+            }]
+        }))
+        .unwrap();
+        let preview = import_guardian_case_bundle(ImportGuardianCaseInput {
+            bytes: zip_bundle(&files, &manifest).unwrap(),
+        })
+        .unwrap();
+        assert!(preview.verified);
+        assert_eq!(preview.file_count, 1);
+
+        let bad_manifest = serde_json::to_vec(&serde_json::json!({
+            "schemaVersion": EXPORT_SCHEMA_VERSION,
+            "profile": "redacted",
+            "caseId": "case-1",
+            "files": [{ "name": "case.json", "sha256": "0".repeat(64), "size": payload.len() }]
+        }))
+        .unwrap();
+        let error = import_guardian_case_bundle(ImportGuardianCaseInput {
+            bytes: zip_bundle(&files, &bad_manifest).unwrap(),
+        })
+        .unwrap_err();
+        assert!(error.contains("hash mismatch"));
     }
 }
