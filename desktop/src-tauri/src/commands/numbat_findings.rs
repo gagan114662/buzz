@@ -130,7 +130,7 @@ fn numbat_findings_template(app: &AppHandle) -> Result<PathBuf, String> {
     Ok(numbat_dir(app)?.join("${BUZZ_MANAGED_AGENT_PUBKEY}.ndjson"))
 }
 
-fn previous_findings_path(path: &Path) -> PathBuf {
+pub(crate) fn previous_findings_path(path: &Path) -> PathBuf {
     path.with_extension("previous.ndjson")
 }
 
@@ -839,6 +839,7 @@ pub fn read_numbat_findings(
         write_health(&app, &agent_pubkey, &batch.health);
     }
     super::guardian_cases::persist_finding_projections(&app, &batch.findings)?;
+    super::guardian_cases::persist_finding_evidence(&app, &batch.findings)?;
     Ok(batch)
 }
 

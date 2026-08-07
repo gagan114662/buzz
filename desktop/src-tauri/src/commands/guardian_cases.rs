@@ -1,4 +1,6 @@
 use std::{
+    collections::HashSet,
+    fs::OpenOptions,
     io::{Cursor, Read as _, Write as _},
     path::PathBuf,
 };
@@ -186,6 +188,14 @@ fn initialize(connection: &Connection) -> Result<(), String> {
                created_by TEXT NOT NULL,
                created_at TEXT NOT NULL,
                result TEXT NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS guardian_evidence_blob (
+               finding_id TEXT NOT NULL,
+               blob_hash TEXT NOT NULL,
+               relative_path TEXT NOT NULL,
+               size_bytes INTEGER NOT NULL,
+               created_at TEXT NOT NULL,
+               PRIMARY KEY (finding_id, blob_hash)
              );",
         )
         .map_err(|error| format!("failed to initialize Guardian case storage: {error}"))
@@ -249,6 +259,112 @@ pub(crate) fn persist_finding_projections(
     transaction
         .commit()
         .map_err(|error| format!("failed to commit Guardian findings: {error}"))
+}
+
+pub(crate) fn persist_finding_evidence(
+    app: &AppHandle,
+    findings: &[NumbatFindingProjection],
+) -> Result<(), String> {
+    if findings.is_empty() {
+        return Ok(());
+    }
+    let wanted = findings
+        .iter()
+        .map(|finding| finding.finding_id.as_str())
+        .collect::<HashSet<_>>();
+    let agent_pubkey = &findings[0].source_agent;
+    if findings
+        .iter()
+        .any(|finding| &finding.source_agent != agent_pubkey)
+    {
+        return Err("Guardian evidence batch crosses agent trust domains".into());
+    }
+    let current = super::numbat_findings::numbat_findings_path(app, agent_pubkey)?;
+    let sources = [
+        current.clone(),
+        super::numbat_findings::previous_findings_path(&current),
+    ];
+    let evidence_dir = managed_agents_base_dir(app)?.join("guardian-evidence");
+    std::fs::create_dir_all(&evidence_dir)
+        .map_err(|error| format!("failed to create Guardian evidence storage: {error}"))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&evidence_dir, std::fs::Permissions::from_mode(0o700))
+            .map_err(|error| format!("failed to protect Guardian evidence storage: {error}"))?;
+    }
+    let connection = open_store(app)?;
+    for source in sources {
+        let bytes = match std::fs::read(&source) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(format!("failed to read Numbat evidence: {error}")),
+        };
+        if bytes.len() > 8 * 1024 * 1024 {
+            return Err("Numbat evidence exceeds the 8 MiB retention limit".into());
+        }
+        for line in bytes.split(|byte| *byte == b'\n') {
+            if line.is_empty() || line.len() > 64 * 1024 {
+                continue;
+            }
+            let value: serde_json::Value = match serde_json::from_slice(line) {
+                Ok(value) => value,
+                Err(_) => continue,
+            };
+            let Some(finding_id) = value.get("finding_id").and_then(|item| item.as_str()) else {
+                continue;
+            };
+            if !wanted.contains(finding_id) {
+                continue;
+            }
+            let blob_hash = hex::encode(Sha256::digest(line));
+            let filename = format!("{blob_hash}.json");
+            let destination = evidence_dir.join(&filename);
+            match OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&destination)
+            {
+                Ok(mut file) => {
+                    file.write_all(line)
+                        .and_then(|_| file.sync_all())
+                        .map_err(|error| format!("failed to persist Guardian evidence: {error}"))?;
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::PermissionsExt as _;
+                        std::fs::set_permissions(
+                            &destination,
+                            std::fs::Permissions::from_mode(0o600),
+                        )
+                        .map_err(|error| format!("failed to protect Guardian evidence: {error}"))?;
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    let existing = std::fs::read(&destination)
+                        .map_err(|error| format!("failed to verify Guardian evidence: {error}"))?;
+                    if hex::encode(Sha256::digest(&existing)) != blob_hash {
+                        return Err("Guardian evidence hash collision detected".into());
+                    }
+                }
+                Err(error) => return Err(format!("failed to create Guardian evidence: {error}")),
+            }
+            connection
+                .execute(
+                    "INSERT OR IGNORE INTO guardian_evidence_blob(
+                   finding_id, blob_hash, relative_path, size_bytes, created_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5)",
+                    params![
+                        finding_id,
+                        blob_hash,
+                        filename,
+                        line.len() as i64,
+                        Utc::now().to_rfc3339()
+                    ],
+                )
+                .map_err(|error| format!("failed to index Guardian evidence: {error}"))?;
+        }
+    }
+    Ok(())
 }
 
 fn owner_pubkey(app: &AppHandle) -> Result<String, String> {
@@ -983,30 +1099,39 @@ pub fn export_guardian_case_bundle(
         .map_err(|error| format!("failed to encode Guardian export payload: {error}"))?;
     let mut files = vec![(entry_name.to_string(), payload_bytes)];
     if input.profile == "full" {
-        let finding_ids = case
-            .finding_ids
-            .iter()
-            .cloned()
-            .collect::<std::collections::HashSet<_>>();
-        let path = super::numbat_findings::numbat_findings_path(&app, &agent_pubkey)?;
-        let bytes = std::fs::read(&path)
-            .map_err(|error| format!("failed to read local Numbat forensic evidence: {error}"))?;
-        if bytes.len() > 8 * 1024 * 1024 {
-            return Err("local Numbat forensic evidence exceeds the 8 MiB export limit".into());
-        }
         let mut selected = Vec::new();
-        for line in bytes.split(|byte| *byte == b'\n') {
-            if line.is_empty() {
-                continue;
-            }
-            let value: serde_json::Value = serde_json::from_slice(line)
-                .map_err(|error| format!("local Numbat forensic evidence is invalid: {error}"))?;
-            if value
-                .get("finding_id")
-                .and_then(|item| item.as_str())
-                .is_some_and(|finding_id| finding_ids.contains(finding_id))
-            {
-                selected.extend_from_slice(line);
+        let evidence_dir = managed_agents_base_dir(&app)?.join("guardian-evidence");
+        for finding_id in &case.finding_ids {
+            let mut statement = connection
+                .prepare(
+                    "SELECT blob_hash, relative_path, size_bytes FROM guardian_evidence_blob
+                 WHERE finding_id = ?1 ORDER BY created_at",
+                )
+                .map_err(|error| format!("failed to prepare Guardian evidence export: {error}"))?;
+            let rows = statement
+                .query_map([finding_id], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
+                })
+                .map_err(|error| format!("failed to list Guardian evidence blobs: {error}"))?;
+            for row in rows {
+                let (expected_hash, relative_path, expected_size) = row
+                    .map_err(|error| format!("failed to read Guardian evidence index: {error}"))?;
+                if relative_path.contains('/') || relative_path.contains('\\') {
+                    return Err("Guardian evidence index contains an unsafe path".into());
+                }
+                let bytes = std::fs::read(evidence_dir.join(relative_path)).map_err(|error| {
+                    format!("failed to read immutable Guardian evidence: {error}")
+                })?;
+                if bytes.len() as i64 != expected_size
+                    || hex::encode(Sha256::digest(&bytes)) != expected_hash
+                {
+                    return Err("immutable Guardian evidence failed integrity verification".into());
+                }
+                selected.extend_from_slice(&bytes);
                 selected.push(b'\n');
             }
         }
