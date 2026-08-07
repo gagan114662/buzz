@@ -3,6 +3,7 @@
 //! This module deliberately contains no effect dispatcher.  It is the durable
 //! boundary that a dispatcher must satisfy before it can perform work.
 
+use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -60,6 +61,171 @@ pub struct DurableTaskCore {
     pub input_hashes: Vec<String>,
     pub artifact_hashes: Vec<String>,
     pub unresolved_blocking_decisions: Vec<String>,
+}
+
+/// Endpoint-local append-only storage. Relay state is never consulted here.
+pub struct DurableTaskStore<'a> {
+    connection: &'a mut Connection,
+}
+
+impl<'a> DurableTaskStore<'a> {
+    pub fn new(connection: &'a mut Connection) -> Result<Self, String> {
+        connection
+            .execute_batch(
+                "PRAGMA foreign_keys = ON;
+                 CREATE TABLE IF NOT EXISTS guardian_durable_task_revision (
+                   task_id TEXT NOT NULL,
+                   revision INTEGER NOT NULL,
+                   revision_hash TEXT NOT NULL UNIQUE,
+                   previous_revision_hash TEXT,
+                   status TEXT NOT NULL,
+                   canonical_json BLOB NOT NULL,
+                   PRIMARY KEY (task_id, revision)
+                 );
+                 CREATE TABLE IF NOT EXISTS guardian_durable_task_head (
+                   task_id TEXT PRIMARY KEY,
+                   revision INTEGER NOT NULL,
+                   revision_hash TEXT NOT NULL,
+                   FOREIGN KEY (task_id, revision)
+                     REFERENCES guardian_durable_task_revision(task_id, revision)
+                 );",
+            )
+            .map_err(|error| format!("failed to initialize durable task store: {error}"))?;
+        Ok(Self { connection })
+    }
+
+    pub fn create(&mut self, task: &DurableTaskCore) -> Result<String, String> {
+        task.validate_shape()?;
+        if task.revision != 1 || task.previous_revision_hash.is_some() {
+            return Err("initial durable task must be revision 1 without a parent hash".into());
+        }
+        let bytes = canonical_bytes(task)?;
+        let hash = hex::encode(Sha256::digest(&bytes));
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| format!("failed to begin durable task transaction: {error}"))?;
+        let exists = transaction
+            .query_row(
+                "SELECT 1 FROM guardian_durable_task_head WHERE task_id = ?1",
+                [&task.task_id],
+                |_| Ok(()),
+            )
+            .optional()
+            .map_err(|error| format!("failed to inspect durable task head: {error}"))?
+            .is_some();
+        if exists {
+            return Err("durable task already exists".into());
+        }
+        insert_revision(&transaction, task, &bytes, &hash)?;
+        transaction
+            .execute(
+                "INSERT INTO guardian_durable_task_head(task_id, revision, revision_hash)
+                 VALUES (?1, ?2, ?3)",
+                params![task.task_id, task.revision, hash],
+            )
+            .map_err(|error| format!("failed to create durable task head: {error}"))?;
+        transaction
+            .commit()
+            .map_err(|error| format!("failed to commit durable task: {error}"))?;
+        Ok(hash)
+    }
+
+    pub fn compare_and_swap(
+        &mut self,
+        expected_head_hash: &str,
+        next: &DurableTaskCore,
+    ) -> Result<String, String> {
+        validate_sha256(expected_head_hash)?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| format!("failed to begin durable task transaction: {error}"))?;
+        let (head_hash, bytes): (String, Vec<u8>) = transaction
+            .query_row(
+                "SELECT h.revision_hash, r.canonical_json
+                 FROM guardian_durable_task_head h
+                 JOIN guardian_durable_task_revision r
+                   ON r.task_id = h.task_id AND r.revision = h.revision
+                 WHERE h.task_id = ?1",
+                [&next.task_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .map_err(|error| format!("durable task head is unavailable: {error}"))?;
+        if head_hash != expected_head_hash {
+            return Err("durable task compare-and-swap conflict".into());
+        }
+        let previous: DurableTaskCore = serde_json::from_slice(&bytes)
+            .map_err(|error| format!("stored durable task is corrupt: {error}"))?;
+        validate_revision(&previous, next)?;
+        let next_bytes = canonical_bytes(next)?;
+        let next_hash = hex::encode(Sha256::digest(&next_bytes));
+        insert_revision(&transaction, next, &next_bytes, &next_hash)?;
+        let changed = transaction
+            .execute(
+                "UPDATE guardian_durable_task_head
+                 SET revision = ?1, revision_hash = ?2
+                 WHERE task_id = ?3 AND revision_hash = ?4",
+                params![next.revision, next_hash, next.task_id, expected_head_hash],
+            )
+            .map_err(|error| format!("failed to update durable task head: {error}"))?;
+        if changed != 1 {
+            return Err("durable task compare-and-swap conflict".into());
+        }
+        transaction
+            .commit()
+            .map_err(|error| format!("failed to commit durable task revision: {error}"))?;
+        Ok(next_hash)
+    }
+
+    pub fn load_head(&self, task_id: &str) -> Result<Option<(DurableTaskCore, String)>, String> {
+        self.connection
+            .query_row(
+                "SELECT r.canonical_json, h.revision_hash
+                 FROM guardian_durable_task_head h
+                 JOIN guardian_durable_task_revision r
+                   ON r.task_id = h.task_id AND r.revision = h.revision
+                 WHERE h.task_id = ?1",
+                [task_id],
+                |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()
+            .map_err(|error| format!("failed to load durable task head: {error}"))?
+            .map(|(bytes, hash)| {
+                serde_json::from_slice(&bytes)
+                    .map(|task| (task, hash))
+                    .map_err(|error| format!("stored durable task is corrupt: {error}"))
+            })
+            .transpose()
+    }
+}
+
+fn insert_revision(
+    transaction: &rusqlite::Transaction<'_>,
+    task: &DurableTaskCore,
+    canonical_json: &[u8],
+    revision_hash: &str,
+) -> Result<(), String> {
+    transaction
+        .execute(
+            "INSERT INTO guardian_durable_task_revision(
+               task_id, revision, revision_hash, previous_revision_hash, status, canonical_json
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                task.task_id,
+                task.revision,
+                revision_hash,
+                task.previous_revision_hash,
+                format!("{:?}", task.status),
+                canonical_json,
+            ],
+        )
+        .map_err(|error| format!("failed to append durable task revision: {error}"))?;
+    Ok(())
+}
+
+fn canonical_bytes(task: &DurableTaskCore) -> Result<Vec<u8>, String> {
+    serde_json::to_vec(task).map_err(|error| format!("failed to encode durable task: {error}"))
 }
 
 impl DurableTaskCore {
@@ -149,7 +315,11 @@ pub fn validate_revision(previous: &DurableTaskCore, next: &DurableTaskCore) -> 
 }
 
 fn validate_sha256(value: &str) -> Result<(), String> {
-    if value.len() != 64 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+    if value.len() != 64
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+    {
         return Err("invalid sha256 binding".into());
     }
     Ok(())
@@ -226,5 +396,42 @@ mod tests {
         assert!(value.validate_delivery(true).is_err());
         value.unresolved_blocking_decisions.clear();
         assert!(value.validate_delivery(true).is_ok());
+    }
+
+    #[test]
+    fn store_appends_by_compare_and_swap_and_survives_reopen() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        let mut store = DurableTaskStore::new(&mut connection).unwrap();
+        let first = task();
+        let first_hash = store.create(&first).unwrap();
+
+        let mut second = first.clone();
+        second.revision = 2;
+        second.status = TaskStatus::Waiting;
+        second.previous_revision_hash = Some(first_hash.clone());
+        let second_hash = store.compare_and_swap(&first_hash, &second).unwrap();
+        let (loaded, loaded_hash) = store.load_head("task-1").unwrap().unwrap();
+        assert_eq!(loaded, second);
+        assert_eq!(loaded_hash, second_hash);
+    }
+
+    #[test]
+    fn store_rejects_duplicate_create_stale_writer_and_changed_payload_parent() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        let mut store = DurableTaskStore::new(&mut connection).unwrap();
+        let first = task();
+        let first_hash = store.create(&first).unwrap();
+        assert!(store.create(&first).is_err());
+
+        let mut second = first.clone();
+        second.revision = 2;
+        second.status = TaskStatus::Waiting;
+        second.previous_revision_hash = Some(first_hash.clone());
+        store.compare_and_swap(&first_hash, &second).unwrap();
+
+        let mut conflicting = second.clone();
+        conflicting.revision = 3;
+        conflicting.previous_revision_hash = Some("f".repeat(64));
+        assert!(store.compare_and_swap(&first_hash, &conflicting).is_err());
     }
 }
