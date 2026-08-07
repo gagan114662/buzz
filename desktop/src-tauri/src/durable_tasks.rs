@@ -3,6 +3,7 @@
 //! This module deliberately contains no effect dispatcher.  It is the durable
 //! boundary that a dispatcher must satisfy before it can perform work.
 
+use chrono::{DateTime, Utc};
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -61,6 +62,34 @@ pub struct DurableTaskCore {
     pub input_hashes: Vec<String>,
     pub artifact_hashes: Vec<String>,
     pub unresolved_blocking_decisions: Vec<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RevalidationSnapshot {
+    pub owner_pubkey: String,
+    pub actor_pubkey: String,
+    pub authority_grant_id: String,
+    pub authority_active: bool,
+    pub policy_hash: String,
+    pub sandbox_profile_hash: String,
+    pub runtime_attestation_hash: String,
+    pub execution_locus: String,
+    pub input_hashes: Vec<String>,
+    pub artifact_hashes: Vec<String>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RevalidationFailure {
+    Authority,
+    Policy,
+    Sandbox,
+    RuntimeAttestation,
+    ExecutionLocus,
+    Inputs,
+    Artifacts,
+    TokenBudget,
+    CostBudget,
+    WallDeadline,
 }
 
 /// Endpoint-local append-only storage. Relay state is never consulted here.
@@ -281,6 +310,73 @@ impl DurableTaskCore {
         }
         Ok(())
     }
+
+    /// Re-resolves every authority-bearing binding immediately before an
+    /// effect. Callers must persist `paused_revalidation` before returning a
+    /// failure to the operator.
+    pub fn revalidate_before_effect(
+        &self,
+        snapshot: &RevalidationSnapshot,
+        now: DateTime<Utc>,
+    ) -> Result<(), RevalidationFailure> {
+        if !snapshot.authority_active
+            || snapshot.owner_pubkey != self.owner_pubkey
+            || snapshot.actor_pubkey != self.actor_pubkey
+            || snapshot.authority_grant_id != self.authority_grant_id
+            || expired(&self.authority_expires_at, now)
+        {
+            return Err(RevalidationFailure::Authority);
+        }
+        if snapshot.policy_hash != self.bindings.policy_hash {
+            return Err(RevalidationFailure::Policy);
+        }
+        if snapshot.sandbox_profile_hash != self.bindings.sandbox_profile_hash {
+            return Err(RevalidationFailure::Sandbox);
+        }
+        if snapshot.runtime_attestation_hash != self.bindings.runtime_attestation_hash
+            || expired(&self.bindings.runtime_attestation_expires_at, now)
+        {
+            return Err(RevalidationFailure::RuntimeAttestation);
+        }
+        if snapshot.execution_locus != self.bindings.execution_locus {
+            return Err(RevalidationFailure::ExecutionLocus);
+        }
+        if snapshot.input_hashes != self.input_hashes {
+            return Err(RevalidationFailure::Inputs);
+        }
+        if snapshot.artifact_hashes != self.artifact_hashes {
+            return Err(RevalidationFailure::Artifacts);
+        }
+        if self
+            .budget
+            .token_limit
+            .is_some_and(|limit| self.budget.consumed_tokens >= limit)
+        {
+            return Err(RevalidationFailure::TokenBudget);
+        }
+        if self
+            .budget
+            .cost_limit_microusd
+            .is_some_and(|limit| self.budget.consumed_microusd >= limit)
+        {
+            return Err(RevalidationFailure::CostBudget);
+        }
+        if self
+            .budget
+            .wall_deadline
+            .as_deref()
+            .is_some_and(|deadline| expired(deadline, now))
+        {
+            return Err(RevalidationFailure::WallDeadline);
+        }
+        Ok(())
+    }
+}
+
+fn expired(value: &str, now: DateTime<Utc>) -> bool {
+    DateTime::parse_from_rfc3339(value)
+        .map(|timestamp| timestamp.with_timezone(&Utc) <= now)
+        .unwrap_or(true)
 }
 
 /// Stable across retries: attempt number is intentionally excluded.
@@ -433,5 +529,61 @@ mod tests {
         conflicting.revision = 3;
         conflicting.previous_revision_hash = Some("f".repeat(64));
         assert!(store.compare_and_swap(&first_hash, &conflicting).is_err());
+    }
+
+    fn snapshot(value: &DurableTaskCore) -> RevalidationSnapshot {
+        RevalidationSnapshot {
+            owner_pubkey: value.owner_pubkey.clone(),
+            actor_pubkey: value.actor_pubkey.clone(),
+            authority_grant_id: value.authority_grant_id.clone(),
+            authority_active: true,
+            policy_hash: value.bindings.policy_hash.clone(),
+            sandbox_profile_hash: value.bindings.sandbox_profile_hash.clone(),
+            runtime_attestation_hash: value.bindings.runtime_attestation_hash.clone(),
+            execution_locus: value.bindings.execution_locus.clone(),
+            input_hashes: value.input_hashes.clone(),
+            artifact_hashes: value.artifact_hashes.clone(),
+        }
+    }
+
+    #[test]
+    fn pre_effect_gate_accepts_only_exact_live_bindings() {
+        let value = task();
+        let now = "2029-01-01T00:00:00Z".parse::<DateTime<Utc>>().unwrap();
+        assert_eq!(
+            value.revalidate_before_effect(&snapshot(&value), now),
+            Ok(())
+        );
+
+        let mut drifted = snapshot(&value);
+        drifted.policy_hash = "f".repeat(64);
+        assert_eq!(
+            value.revalidate_before_effect(&drifted, now),
+            Err(RevalidationFailure::Policy)
+        );
+        drifted = snapshot(&value);
+        drifted.input_hashes[0] = "f".repeat(64);
+        assert_eq!(
+            value.revalidate_before_effect(&drifted, now),
+            Err(RevalidationFailure::Inputs)
+        );
+    }
+
+    #[test]
+    fn pre_effect_gate_fails_closed_on_expiry_and_exhausted_budget() {
+        let value = task();
+        let expired_now = "2030-01-01T00:00:00Z".parse::<DateTime<Utc>>().unwrap();
+        assert_eq!(
+            value.revalidate_before_effect(&snapshot(&value), expired_now),
+            Err(RevalidationFailure::Authority)
+        );
+
+        let mut exhausted = task();
+        exhausted.budget.consumed_tokens = 100;
+        let valid_now = "2029-01-01T00:00:00Z".parse::<DateTime<Utc>>().unwrap();
+        assert_eq!(
+            exhausted.revalidate_before_effect(&snapshot(&exhausted), valid_now),
+            Err(RevalidationFailure::TokenBudget)
+        );
     }
 }
