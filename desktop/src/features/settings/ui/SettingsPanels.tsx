@@ -91,6 +91,7 @@ import { SettingsSectionHeader } from "./SettingsSectionHeader";
 import { VoiceSettingsCard } from "./VoiceSettingsCard";
 import { GuardianNumbatSettingsCard } from "./GuardianNumbatSettingsCard";
 import { GuardianFleetSettingsCard } from "./GuardianFleetSettingsCard";
+import { GuardianSandboxSettingsCard } from "./GuardianSandboxSettingsCard";
 
 export type SettingsSection =
   | "profile"
@@ -880,6 +881,7 @@ export function renderSettingsSection(
           <PreventSleepSettingsCard />
           <GuardianNumbatSettingsCard />
           <GuardianFleetSettingsCard currentPubkey={props.currentPubkey} />
+          <GuardianSandboxSettingsCard />
           <HarnessesSettingsPanel />
           <AgentDefaultsSettingsCard />
         </div>

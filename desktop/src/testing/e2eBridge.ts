@@ -13192,6 +13192,27 @@ export function maybeInstallE2eTauriMocks() {
         mockGuardianFleet = { ...mockGuardianFleet, emergencyStopped: stopped };
         return mockGuardianFleet;
       }
+      case "get_guardian_sandbox_status":
+        return {
+          schemaVersion: "guardian.macos-vm-sandbox/v1",
+          backend: "macos-virtualization",
+          state: "unconfigured",
+          detail:
+            "No signed helper and pinned virtual-machine image have been configured.",
+          helperPath: null,
+          vmImagePath: null,
+          helperVerified: false,
+          imageVerified: false,
+          signatureVerified: false,
+          teamIdentifier: null,
+          capabilities: null,
+        };
+      case "configure_guardian_macos_vm_sandbox":
+        throw new Error(
+          "sandbox helper signature could not be verified in the browser simulation",
+        );
+      case "validate_guardian_sandbox_profile":
+        throw new Error("sandbox is not configured");
       case "set_prevent_sleep_active":
         return null;
       case "plugin:window|is_fullscreen":

@@ -34,3 +34,19 @@ test("loads a synthetic fleet and exercises emergency stop", async ({
   await stop.click();
   await expect(stop).toHaveText("Emergency stop");
 });
+
+test("shows strong isolation as unavailable until trust is verified", async ({
+  page,
+}) => {
+  await installMockBridge(page);
+  await page.goto("/", { waitUntil: "domcontentloaded" });
+  await openSettings(page, "agents");
+
+  const sandbox = page.getByTestId("settings-guardian-sandbox");
+  await expect(sandbox).toBeVisible();
+  await expect(sandbox).toContainText("unconfigured");
+  await expect(sandbox).not.toContainText("Strong isolation ready");
+  await expect(
+    sandbox.getByRole("button", { name: "Verify and save" }),
+  ).toBeDisabled();
+});
