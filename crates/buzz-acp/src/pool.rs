@@ -4119,9 +4119,10 @@ mod tests {
         let mut ctx = make_prompt_context_no_owner();
         ctx.permission_mode = PermissionMode::DontAsk;
 
-        let session_id = create_session_and_apply_model(&mut agent, &ctx, None, None, None)
-            .await
-            .expect("session creation should succeed without native dontAsk support");
+        let session_id =
+            create_session_and_apply_model(&mut agent, &ctx, None, None, None, None, None)
+                .await
+                .expect("session creation should succeed without native dontAsk support");
         assert_eq!(session_id, "fallback-session");
 
         let stop = agent

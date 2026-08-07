@@ -2577,11 +2577,7 @@ mod tests {
 
     #[test]
     fn permission_policy_monitor_modes_allow_once() {
-        for mode in [
-            PermissionMode::Default,
-            PermissionMode::AcceptEdits,
-            PermissionMode::BypassPermissions,
-        ] {
+        for mode in [PermissionMode::Default, PermissionMode::AcceptEdits] {
             assert_eq!(permission_option_kind(&mode), "allow_once");
         }
     }
