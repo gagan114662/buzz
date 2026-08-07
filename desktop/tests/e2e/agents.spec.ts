@@ -158,6 +158,32 @@ async function invokeTauri<T>(
   );
 }
 
+test("starts a job-shaped assistant from an outcome and minimum access", async ({
+  page,
+}) => {
+  await gotoApp(page);
+  await page.getByTestId("open-agents-view").click();
+
+  const starter = page.getByTestId("outcome-assistant-starter");
+  await expect(starter).toBeVisible();
+  await starter.getByTestId("outcome-preset-research").click();
+  await starter
+    .getByTestId("outcome-request")
+    .fill("Compare three vendors with sourced evidence");
+  await starter.getByLabel("Signed-in browser").check();
+  await starter.getByTestId("review-outcome-assistant").click();
+
+  const dialog = page.getByTestId("persona-dialog");
+  await expect(dialog).toBeVisible();
+  await expect(dialog.getByLabel("Agent name")).toHaveValue("Research Scout");
+  await expect(dialog.getByLabel("Agent instruction")).toHaveValue(
+    /Compare three vendors with sourced evidence/,
+  );
+  await expect(dialog.getByLabel("Agent instruction")).toHaveValue(
+    /buzz-completion-packet/,
+  );
+});
+
 async function invokeTauriExpectError(
   page: import("@playwright/test").Page,
   command: string,
