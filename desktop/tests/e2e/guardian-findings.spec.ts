@@ -101,6 +101,10 @@ test("renders three privacy-projected Guardian alerts", async ({ page }) => {
   await expect(guardian.getByTestId("guardian-case-count")).toContainText(
     "1 local investigation case",
   );
+  const caseList = guardian.getByTestId("guardian-case-list");
+  await caseList.getByTestId("guardian-advance-case").click();
+  await expect(caseList).toContainText("triaged");
+  await caseList.getByTestId("guardian-export-redacted-case").click();
 
   await highFinding.getByTestId("guardian-suppress-finding").click();
   const suppressionForm = highFinding.getByTestId("guardian-suppression-form");
@@ -109,4 +113,36 @@ test("renders three privacy-projected Guardian alerts", async ({ page }) => {
     .fill("Known local test activity");
   await suppressionForm.getByRole("button", { name: "Suppress 24h" }).click();
   await expect(highFinding).toContainText("Suppressed");
+  await highFinding.getByTestId("guardian-renew-suppression").click();
+  await expect(highFinding).toContainText("Suppressed");
+  await highFinding.getByTestId("guardian-cancel-suppression").click();
+  await expect(highFinding.getByTestId("guardian-suppress-finding")).toHaveText(
+    "Suppress",
+  );
+
+  const policyWorkspace = guardian.getByTestId("guardian-policy-workspace");
+  await policyWorkspace.locator("summary").click();
+  await policyWorkspace.getByTestId("guardian-create-deny-policy").click();
+  const nextPolicyAction = policyWorkspace.getByTestId(
+    "guardian-policy-next-action",
+  );
+  for (const label of [
+    "simulate",
+    "request approval",
+    "approve",
+    "stage local canary",
+    "activate",
+  ]) {
+    await expect(nextPolicyAction).toHaveText(label);
+    await nextPolicyAction.click();
+  }
+  await expect(policyWorkspace).toContainText("active");
+
+  await guardian
+    .getByTestId("guardian-import-case-input")
+    .setInputFiles({
+      name: "guardian-case-redacted.zip",
+      mimeType: "application/zip",
+      buffer: Buffer.from("mock-verified-bundle"),
+    });
 });

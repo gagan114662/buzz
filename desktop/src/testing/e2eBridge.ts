@@ -3012,11 +3012,20 @@ type MockSaveSubscriptionRow = {
   kinds: string; // JSON-encoded integer array, e.g. "[9,40002]"
 };
 let mockSaveSubscriptions: MockSaveSubscriptionRow[] = [];
+let mockGuardianCases: Array<Record<string, unknown>> = [];
+let mockGuardianSuppressions: Array<Record<string, unknown>> = [];
+let mockGuardianPolicies: Array<Record<string, unknown>> = [];
 
 function resetMockSaveSubscriptions(config: E2eConfig | undefined) {
   mockSaveSubscriptions = (config?.mock?.saveSubscriptions ?? []).map((s) => ({
     ...s,
   }));
+}
+
+function resetMockGuardianState() {
+  mockGuardianCases = [];
+  mockGuardianSuppressions = [];
+  mockGuardianPolicies = [];
 }
 
 function resetMockPersonaCatalogEvents(config: E2eConfig | undefined) {
@@ -9991,6 +10000,7 @@ export function maybeInstallE2eTauriMocks() {
   resetMockUserStatuses();
   resetMockPersonaCatalogEvents(config);
   resetMockSaveSubscriptions(config);
+  resetMockGuardianState();
   resetMockPendingCommunityDeepLinks(config);
   initializeMockHuddle(config.mock?.huddle, config);
   mockWebsocketSendMutexWedged = false;
@@ -12919,9 +12929,9 @@ export function maybeInstallE2eTauriMocks() {
       case "acknowledge_guardian_finding":
         return `mock-action-${String((payload as { findingId?: string }).findingId ?? "finding")}`;
       case "list_guardian_cases":
-        return [];
+        return mockGuardianCases;
       case "list_guardian_suppressions":
-        return [];
+        return mockGuardianSuppressions;
       case "create_guardian_case": {
         const request = (
           payload as {
@@ -12929,7 +12939,7 @@ export function maybeInstallE2eTauriMocks() {
           }
         ).input;
         const now = new Date().toISOString();
-        return {
+        const created = {
           caseId: "mock-guardian-case",
           title: request?.title ?? "Guardian investigation",
           status: "new",
@@ -12938,6 +12948,8 @@ export function maybeInstallE2eTauriMocks() {
           openedAt: now,
           updatedAt: now,
         };
+        mockGuardianCases = [created, ...mockGuardianCases];
+        return created;
       }
       case "create_guardian_suppression": {
         const request = (
@@ -12949,17 +12961,154 @@ export function maybeInstallE2eTauriMocks() {
             };
           }
         ).input;
-        return {
-          suppressionId: "mock-guardian-suppression",
+        const created = {
+          suppressionId: `mock-guardian-suppression-${mockGuardianSuppressions.length + 1}`,
           findingId: request?.findingId ?? "finding",
           reason: request?.reason ?? "reviewed",
           startsAt: new Date().toISOString(),
           expiresAt: request?.expiresAt ?? new Date().toISOString(),
           status: "active",
         };
+        const replaces = request as { replacesSuppressionId?: string };
+        if (replaces?.replacesSuppressionId) {
+          mockGuardianSuppressions = mockGuardianSuppressions.map((item) =>
+            item.suppressionId === replaces.replacesSuppressionId
+              ? { ...item, status: "superseded" }
+              : item,
+          );
+        }
+        mockGuardianSuppressions = [created, ...mockGuardianSuppressions];
+        return created;
       }
-      case "update_guardian_case_status":
-        throw new Error("No mock Guardian case is persisted");
+      case "cancel_guardian_suppression": {
+        const request = (payload as { input?: { suppressionId?: string } })
+          .input;
+        const current = mockGuardianSuppressions.find(
+          (item) => item.suppressionId === request?.suppressionId,
+        );
+        if (!current) throw new Error("Mock Guardian suppression not found");
+        const cancelled = { ...current, status: "cancelled" };
+        mockGuardianSuppressions = mockGuardianSuppressions.map((item) =>
+          item.suppressionId === request?.suppressionId ? cancelled : item,
+        );
+        return cancelled;
+      }
+      case "update_guardian_case_status": {
+        const request = (
+          payload as { input?: { caseId?: string; status?: string } }
+        ).input;
+        const current = mockGuardianCases.find(
+          (item) => item.caseId === request?.caseId,
+        );
+        if (!current) throw new Error("Mock Guardian case not found");
+        const updated = {
+          ...current,
+          status: request?.status ?? current.status,
+          updatedAt: new Date().toISOString(),
+        };
+        mockGuardianCases = mockGuardianCases.map((item) =>
+          item.caseId === request?.caseId ? updated : item,
+        );
+        return updated;
+      }
+      case "save_guardian_case_bundle":
+        return true;
+      case "import_guardian_case_bundle":
+        return {
+          schemaVersion: "guardian.case-export/v1",
+          profile: "redacted",
+          caseId: "mock-imported-case",
+          fileCount: 1,
+          verified: true,
+        };
+      case "list_guardian_policy_versions":
+        return mockGuardianPolicies;
+      case "create_guardian_policy_draft": {
+        const request = (
+          payload as {
+            input?: {
+              agentPubkey?: string;
+              name?: string;
+              mode?: string;
+              rules?: unknown[];
+            };
+          }
+        ).input;
+        const now = new Date().toISOString();
+        const created = {
+          policyHash: `${mockGuardianPolicies.length + 1}`.padStart(64, "a"),
+          schemaVersion: "guardian.policy/v1",
+          agentPubkey: request?.agentPubkey ?? "",
+          name: request?.name ?? "Policy",
+          mode: request?.mode ?? "monitor",
+          rules: request?.rules ?? [],
+          state: "draft",
+          corpusVersion: null,
+          simulationHash: null,
+          createdAt: now,
+          updatedAt: now,
+        };
+        mockGuardianPolicies = [created, ...mockGuardianPolicies];
+        return created;
+      }
+      case "simulate_guardian_policy": {
+        const request = payload as { policyHash?: string };
+        const simulationHash = "b".repeat(64);
+        mockGuardianPolicies = mockGuardianPolicies.map((item) =>
+          item.policyHash === request.policyHash
+            ? {
+                ...item,
+                state: "simulated",
+                corpusVersion: "guardian.policy-corpus/v1",
+                simulationHash,
+              }
+            : item,
+        );
+        return {
+          policyHash: request.policyHash,
+          corpusVersion: "guardian.policy-corpus/v1",
+          simulationHash,
+          passed: true,
+          allowCount: 1,
+          denyCount: 6,
+          unsupportedCount: 0,
+          partitions: [
+            "allow",
+            "deny",
+            "boundary",
+            "runtime-adapters",
+            "regressions",
+            "resource",
+            "privacy",
+          ],
+        };
+      }
+      case "transition_guardian_policy": {
+        const request = (
+          payload as { input?: { policyHash?: string; action?: string } }
+        ).input;
+        const stateByAction: Record<string, string> = {
+          request_approval: "awaiting_approval",
+          approve: "approved",
+          stage_local_canary: "staged",
+          activate: "active",
+          pause: "paused",
+          rollback: "rolled_back",
+          abandon: "abandoned",
+        };
+        let updated: Record<string, unknown> | undefined;
+        mockGuardianPolicies = mockGuardianPolicies.map((item) => {
+          if (item.policyHash !== request?.policyHash) return item;
+          updated = {
+            ...item,
+            state: stateByAction[request?.action ?? ""] ?? item.state,
+            updatedAt: new Date().toISOString(),
+          };
+          return updated;
+        });
+        if (!updated) throw new Error("Mock Guardian policy not found");
+        return updated;
+      }
       case "set_prevent_sleep_active":
         return null;
       case "plugin:window|is_fullscreen":
