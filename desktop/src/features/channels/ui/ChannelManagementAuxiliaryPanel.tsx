@@ -1,7 +1,7 @@
-import type * as React from "react";
+import * as React from "react";
 
 import type { Channel } from "@/shared/api/types";
-import { ChannelManagementSheet } from "@/features/channels/ui/ChannelManagementSheet";
+import { LazyChannelManagementSheet } from "@/features/channels/ui/LazyChannelManagementSheet";
 import { RightAuxiliaryPane } from "@/features/channels/ui/RightAuxiliaryPane";
 
 type ChannelManagementAuxiliaryPanelProps = {
@@ -34,20 +34,24 @@ export function ChannelManagementAuxiliaryPanel({
   transparentChrome = false,
 }: ChannelManagementAuxiliaryPanelProps) {
   const panel = (
-    <ChannelManagementSheet
-      animateSplitEnter={isSinglePanelView && !useSplitAuxiliaryPane}
-      channel={activeChannel}
-      currentPubkey={currentPubkey}
-      layout={useSplitAuxiliaryPane || isSinglePanelView ? "split" : "overlay"}
-      onDeleted={onChannelManagementDeleted}
-      onOpenChange={(nextOpen) => {
-        if (!nextOpen) {
-          onCloseChannelManagement?.();
+    <React.Suspense fallback={null}>
+      <LazyChannelManagementSheet
+        animateSplitEnter={isSinglePanelView && !useSplitAuxiliaryPane}
+        channel={activeChannel}
+        currentPubkey={currentPubkey}
+        layout={
+          useSplitAuxiliaryPane || isSinglePanelView ? "split" : "overlay"
         }
-      }}
-      open={true}
-      transparentChrome={transparentChrome}
-    />
+        onDeleted={onChannelManagementDeleted}
+        onOpenChange={(nextOpen) => {
+          if (!nextOpen) {
+            onCloseChannelManagement?.();
+          }
+        }}
+        open={true}
+        transparentChrome={transparentChrome}
+      />
+    </React.Suspense>
   );
 
   if (!useSplitAuxiliaryPane) {

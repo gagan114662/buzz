@@ -6,7 +6,7 @@ import { useAppNavigation } from "@/app/navigation/useAppNavigation";
 import { useKnownAgentPubkeys } from "@/features/agents/useKnownAgentPubkeys";
 import { useChannelsQuery, useOpenDmMutation } from "@/features/channels/hooks";
 import { RightAuxiliaryPane } from "@/features/channels/ui/RightAuxiliaryPane";
-import { ChannelManagementSheet } from "@/features/channels/ui/ChannelManagementSheet";
+import { LazyChannelManagementSheet } from "@/features/channels/ui/LazyChannelManagementSheet";
 import {
   type InboxFilter,
   type InboxReply,
@@ -968,17 +968,19 @@ export function HomeView({
               testId="home-channel-management-auxiliary-pane"
               widthPx={auxiliaryPaneWidthPx}
             >
-              <ChannelManagementSheet
-                channel={managedChannel}
-                currentPubkey={currentPubkey}
-                layout="split"
-                onOpenChange={(nextOpen) => {
-                  if (!nextOpen) {
-                    setManagedChannelId(null);
-                  }
-                }}
-                open={true}
-              />
+              <React.Suspense fallback={null}>
+                <LazyChannelManagementSheet
+                  channel={managedChannel}
+                  currentPubkey={currentPubkey}
+                  layout="split"
+                  onOpenChange={(nextOpen) => {
+                    if (!nextOpen) {
+                      setManagedChannelId(null);
+                    }
+                  }}
+                  open={true}
+                />
+              </React.Suspense>
             </RightAuxiliaryPane>
           ) : null}
         </div>
