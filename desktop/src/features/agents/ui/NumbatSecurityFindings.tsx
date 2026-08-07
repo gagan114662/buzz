@@ -48,6 +48,9 @@ export function NumbatSecurityFindings({
     () => new Set(),
   );
   const [cases, setCases] = React.useState<GuardianCase[]>([]);
+  const [caseSelection, setCaseSelection] = React.useState<Set<string>>(
+    () => new Set(),
+  );
   const [pendingFinding, setPendingFinding] = React.useState<string | null>(
     null,
   );
@@ -340,6 +343,49 @@ export function NumbatSecurityFindings({
           })}
         </div>
       ) : null}
+      {findings.filter(
+        (finding) =>
+          !cases.some((item) => item.findingIds.includes(finding.findingId)),
+      ).length > 1 ? (
+        <div className="flex flex-wrap items-center gap-2 rounded-md border border-border/70 px-3 py-2">
+          <span className="text-xs text-muted-foreground">
+            {caseSelection.size} findings selected for one investigation
+          </span>
+          <Button
+            data-testid="guardian-create-grouped-case"
+            disabled={
+              caseSelection.size < 2 || pendingFinding === "grouped-case"
+            }
+            onClick={() => {
+              const findingIds = [...caseSelection];
+              setPendingFinding("grouped-case");
+              void createGuardianCase(
+                agentPubkey,
+                findingIds,
+                `Investigation: ${findingIds.length} correlated findings`,
+              )
+                .then((created) => {
+                  setCases((current) => [created, ...current]);
+                  setCaseSelection(new Set());
+                  toast.success("Grouped investigation case opened");
+                })
+                .catch((cause: unknown) =>
+                  toast.error(
+                    cause instanceof Error
+                      ? cause.message
+                      : "Could not open grouped case",
+                  ),
+                )
+                .finally(() => setPendingFinding(null));
+            }}
+            size="xs"
+            type="button"
+            variant="outline"
+          >
+            Open grouped case
+          </Button>
+        </div>
+      ) : null}
       {findings
         .slice()
         .reverse()
@@ -390,6 +436,29 @@ export function NumbatSecurityFindings({
                     {finding.ruleId}
                   </p>
                   <div className="mt-2 flex flex-wrap gap-2">
+                    {!cases.some((item) =>
+                      item.findingIds.includes(finding.findingId),
+                    ) ? (
+                      <label className="flex items-center gap-1.5 text-xs text-muted-foreground">
+                        <input
+                          checked={caseSelection.has(finding.findingId)}
+                          data-testid="guardian-select-case-finding"
+                          onChange={(event) => {
+                            setCaseSelection((current) => {
+                              const next = new Set(current);
+                              if (event.target.checked) {
+                                next.add(finding.findingId);
+                              } else {
+                                next.delete(finding.findingId);
+                              }
+                              return next;
+                            });
+                          }}
+                          type="checkbox"
+                        />
+                        Add to grouped case
+                      </label>
+                    ) : null}
                     <Button
                       data-testid="guardian-acknowledge-finding"
                       disabled={

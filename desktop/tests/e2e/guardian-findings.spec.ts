@@ -88,6 +88,22 @@ test("renders three privacy-projected Guardian alerts", async ({ page }) => {
   await expect(guardian).not.toContainText("observed_command");
   await expect(guardian).not.toContainText("/private/");
 
+  await guardian
+    .locator('[data-finding-id="finding-low"]')
+    .getByTestId("guardian-select-case-finding")
+    .check();
+  await guardian
+    .locator('[data-finding-id="finding-medium"]')
+    .getByTestId("guardian-select-case-finding")
+    .check();
+  await guardian.getByTestId("guardian-create-grouped-case").click();
+  await expect(guardian.getByTestId("guardian-case-count")).toContainText(
+    "1 local investigation case",
+  );
+  await expect(guardian.getByTestId("guardian-case-list")).toContainText(
+    "2 findings",
+  );
+
   const highFinding = guardian.locator('[data-finding-id="finding-high"]');
   await highFinding.getByTestId("guardian-acknowledge-finding").click();
   await expect(
@@ -99,12 +115,12 @@ test("renders three privacy-projected Guardian alerts", async ({ page }) => {
     "Case opened",
   );
   await expect(guardian.getByTestId("guardian-case-count")).toContainText(
-    "1 local investigation case",
+    "2 local investigation cases",
   );
   const caseList = guardian.getByTestId("guardian-case-list");
-  await caseList.getByTestId("guardian-advance-case").click();
+  await caseList.getByTestId("guardian-advance-case").first().click();
   await expect(caseList).toContainText("triaged");
-  await caseList.getByTestId("guardian-export-redacted-case").click();
+  await caseList.getByTestId("guardian-export-redacted-case").first().click();
 
   await highFinding.getByTestId("guardian-suppress-finding").click();
   const suppressionForm = highFinding.getByTestId("guardian-suppression-form");
