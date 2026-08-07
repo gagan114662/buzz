@@ -678,6 +678,7 @@ pub fn run() {
             transition_guardian_policy,
             configure_guardian_fleet,
             get_guardian_fleet,
+            seed_guardian_fleet_simulation,
             register_guardian_fleet_endpoint,
             create_guardian_fleet_rollout,
             approve_guardian_fleet_rollout,

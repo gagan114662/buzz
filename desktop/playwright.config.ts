@@ -47,6 +47,7 @@ export default defineConfig({
         "**/config-bridge-screenshots.spec.ts",
         "**/observer-feed-screenshots.spec.ts",
         "**/guardian-findings.spec.ts",
+        "**/guardian-fleet.spec.ts",
         "**/core-memory-screenshots.spec.ts",
         "**/activity-scope-label-screenshots.spec.ts",
         "**/welcome-agent-modal-screenshots.spec.ts",

@@ -3015,6 +3015,7 @@ let mockSaveSubscriptions: MockSaveSubscriptionRow[] = [];
 let mockGuardianCases: Array<Record<string, unknown>> = [];
 let mockGuardianSuppressions: Array<Record<string, unknown>> = [];
 let mockGuardianPolicies: Array<Record<string, unknown>> = [];
+let mockGuardianFleet: Record<string, unknown> | null = null;
 
 function resetMockSaveSubscriptions(config: E2eConfig | undefined) {
   mockSaveSubscriptions = (config?.mock?.saveSubscriptions ?? []).map((s) => ({
@@ -3026,6 +3027,7 @@ function resetMockGuardianState() {
   mockGuardianCases = [];
   mockGuardianSuppressions = [];
   mockGuardianPolicies = [];
+  mockGuardianFleet = null;
 }
 
 function resetMockPersonaCatalogEvents(config: E2eConfig | undefined) {
@@ -13108,6 +13110,87 @@ export function maybeInstallE2eTauriMocks() {
         });
         if (!updated) throw new Error("Mock Guardian policy not found");
         return updated;
+      }
+      case "seed_guardian_fleet_simulation": {
+        const owner = (activeConfig?.identity ?? DEFAULT_MOCK_IDENTITY).pubkey;
+        const now = new Date().toISOString();
+        const policyHash = "c".repeat(64);
+        mockGuardianFleet = {
+          organizationId: `simulation-${owner}`,
+          name: "Synthetic Acme Operations",
+          ownerPubkey: owner,
+          securityApproverPubkey: "d".repeat(64),
+          emergencyStopped: false,
+          simulation: true,
+          endpoints: [
+            {
+              endpointId: "finance-01",
+              agentPubkey: "1".repeat(64),
+              expectedPolicyHash: policyHash,
+              observedPolicyHash: policyHash,
+              status: "healthy",
+              lastSeenAt: now,
+            },
+            {
+              endpointId: "support-01",
+              agentPubkey: "2".repeat(64),
+              expectedPolicyHash: policyHash,
+              observedPolicyHash: "e".repeat(64),
+              status: "drifted",
+              lastSeenAt: now,
+            },
+            {
+              endpointId: "offline-01",
+              agentPubkey: "3".repeat(64),
+              expectedPolicyHash: policyHash,
+              observedPolicyHash: null,
+              status: "offline",
+              lastSeenAt: null,
+            },
+          ],
+          rollouts: [
+            {
+              rolloutId: "synthetic-staged-rollout",
+              policyHash,
+              state: "deployed",
+              endpointIds: ["finance-01", "support-01", "offline-01"],
+              waveSize: 1,
+              nextIndex: 3,
+              ownerApprovedAt: now,
+              securityApprovedAt: now,
+              createdAt: now,
+            },
+          ],
+        };
+        return mockGuardianFleet;
+      }
+      case "get_guardian_fleet":
+        if (!mockGuardianFleet)
+          throw new Error("Mock Guardian fleet not found");
+        return mockGuardianFleet;
+      case "configure_guardian_fleet": {
+        const request =
+          (payload as { input?: Record<string, string> }).input ?? {};
+        mockGuardianFleet = {
+          organizationId: request.organizationId ?? "mock-org",
+          name: request.name ?? "Mock organization",
+          ownerPubkey: request.ownerPubkey ?? "",
+          securityApproverPubkey: request.securityApproverPubkey ?? "",
+          emergencyStopped: false,
+          simulation: false,
+          endpoints: [],
+          rollouts: [],
+        };
+        return mockGuardianFleet;
+      }
+      case "set_guardian_fleet_emergency_stop": {
+        if (!mockGuardianFleet)
+          throw new Error("Mock Guardian fleet not found");
+        const stopped = Boolean(
+          (payload as { input?: { stopped?: boolean } }).input?.stopped,
+        );
+        mockGuardianFleet = { ...mockGuardianFleet, emergencyStopped: stopped };
+        return mockGuardianFleet;
       }
       case "set_prevent_sleep_active":
         return null;

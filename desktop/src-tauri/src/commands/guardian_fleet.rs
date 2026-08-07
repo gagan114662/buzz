@@ -92,6 +92,7 @@ pub struct GuardianFleet {
     owner_pubkey: String,
     security_approver_pubkey: String,
     emergency_stopped: bool,
+    simulation: bool,
     endpoints: Vec<FleetEndpoint>,
     rollouts: Vec<FleetRollout>,
 }
@@ -118,7 +119,8 @@ fn initialize(connection: &Connection) -> Result<(), String> {
             "PRAGMA foreign_keys=ON;
          CREATE TABLE IF NOT EXISTS guardian_fleet_org(
            organization_id TEXT PRIMARY KEY, name TEXT NOT NULL, owner_pubkey TEXT NOT NULL,
-           security_approver_pubkey TEXT NOT NULL, emergency_stopped INTEGER NOT NULL DEFAULT 0);
+           security_approver_pubkey TEXT NOT NULL, emergency_stopped INTEGER NOT NULL DEFAULT 0,
+           simulation INTEGER NOT NULL DEFAULT 0);
          CREATE TABLE IF NOT EXISTS guardian_fleet_endpoint(
            organization_id TEXT NOT NULL, endpoint_id TEXT NOT NULL, agent_pubkey TEXT NOT NULL,
            expected_policy_hash TEXT, observed_policy_hash TEXT, status TEXT NOT NULL,
@@ -135,7 +137,12 @@ fn initialize(connection: &Connection) -> Result<(), String> {
            action TEXT NOT NULL, actor_pubkey TEXT NOT NULL, subject_id TEXT NOT NULL,
            created_at TEXT NOT NULL, previous_hash TEXT, event_hash TEXT NOT NULL UNIQUE);",
         )
-        .map_err(|e| format!("failed to initialize fleet store: {e}"))
+        .map_err(|e| format!("failed to initialize fleet store: {e}"))?;
+    let _ = connection.execute(
+        "ALTER TABLE guardian_fleet_org ADD COLUMN simulation INTEGER NOT NULL DEFAULT 0",
+        [],
+    );
+    Ok(())
 }
 
 fn pubkey(value: &str) -> Result<String, String> {
@@ -218,9 +225,9 @@ fn endpoint_status(
 }
 
 fn read_fleet(connection: &Connection, org: &str) -> Result<GuardianFleet, String> {
-    let (name, owner, security, stopped): (String,String,String,bool) = connection.query_row(
-        "SELECT name,owner_pubkey,security_approver_pubkey,emergency_stopped FROM guardian_fleet_org WHERE organization_id=?1", [org],
-        |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).optional()
+    let (name, owner, security, stopped, simulation): (String,String,String,bool,bool) = connection.query_row(
+        "SELECT name,owner_pubkey,security_approver_pubkey,emergency_stopped,simulation FROM guardian_fleet_org WHERE organization_id=?1", [org],
+        |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?))).optional()
         .map_err(|e| format!("failed to read organization: {e}"))?.ok_or_else(|| "organization was not found".to_string())?;
     let mut statement = connection.prepare("SELECT endpoint_id,agent_pubkey,expected_policy_hash,observed_policy_hash,status,last_seen_at FROM guardian_fleet_endpoint WHERE organization_id=?1 ORDER BY endpoint_id")
         .map_err(|e| format!("failed to prepare endpoint list: {e}"))?;
@@ -271,6 +278,7 @@ fn read_fleet(connection: &Connection, org: &str) -> Result<GuardianFleet, Strin
         owner_pubkey: owner,
         security_approver_pubkey: security,
         emergency_stopped: stopped,
+        simulation,
         endpoints,
         rollouts,
     })
@@ -310,7 +318,7 @@ pub fn configure_guardian_fleet(
     {
         return Err("organization already belongs to a different owner".into());
     }
-    connection.execute("INSERT INTO guardian_fleet_org(organization_id,name,owner_pubkey,security_approver_pubkey) VALUES(?1,?2,?3,?4) ON CONFLICT(organization_id) DO UPDATE SET name=excluded.name,security_approver_pubkey=excluded.security_approver_pubkey WHERE owner_pubkey=excluded.owner_pubkey",params![org,input.name.trim(),owner,security]).map_err(|e| format!("failed to configure organization: {e}"))?;
+    connection.execute("INSERT INTO guardian_fleet_org(organization_id,name,owner_pubkey,security_approver_pubkey,simulation) VALUES(?1,?2,?3,?4,0) ON CONFLICT(organization_id) DO UPDATE SET name=excluded.name,security_approver_pubkey=excluded.security_approver_pubkey WHERE owner_pubkey=excluded.owner_pubkey",params![org,input.name.trim(),owner,security]).map_err(|e| format!("failed to configure organization: {e}"))?;
     audit(&connection, &org, "configure", &current, &org)?;
     read_fleet(&connection, &org)
 }
@@ -322,6 +330,72 @@ pub fn get_guardian_fleet(
 ) -> Result<GuardianFleet, String> {
     let org = token(&organization_id, "organization id")?;
     read_fleet(&open(&app)?, &org)
+}
+
+#[tauri::command]
+pub fn seed_guardian_fleet_simulation(
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<GuardianFleet, String> {
+    let owner = actor(&state)?;
+    let organization_id = format!("simulation-{owner}");
+    let security = hex::encode(Sha256::digest(format!("{owner}:security-approver")));
+    let healthy_agent = hex::encode(Sha256::digest(format!("{owner}:healthy-agent")));
+    let drifted_agent = hex::encode(Sha256::digest(format!("{owner}:drifted-agent")));
+    let offline_agent = hex::encode(Sha256::digest(format!("{owner}:offline-agent")));
+    let policy = hex::encode(Sha256::digest(b"guardian synthetic deny policy v1"));
+    let drifted_policy = hex::encode(Sha256::digest(b"guardian stale synthetic policy"));
+    let rollout_id = "synthetic-staged-rollout";
+    let now = Utc::now().to_rfc3339();
+    let endpoints = serde_json::to_string(&["finance-01", "support-01", "offline-01"])
+        .map_err(|e| e.to_string())?;
+    let mut connection = open(&app)?;
+    let tx = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(|e| e.to_string())?;
+    tx.execute(
+        "INSERT INTO guardian_fleet_org(organization_id,name,owner_pubkey,security_approver_pubkey,emergency_stopped,simulation) VALUES(?1,'Synthetic Acme Operations',?2,?3,0,1) ON CONFLICT(organization_id) DO UPDATE SET name=excluded.name,security_approver_pubkey=excluded.security_approver_pubkey,emergency_stopped=0,simulation=1 WHERE owner_pubkey=excluded.owner_pubkey",
+        params![organization_id, owner, security],
+    ).map_err(|e| format!("failed to seed simulated organization: {e}"))?;
+    tx.execute(
+        "DELETE FROM guardian_fleet_endpoint WHERE organization_id=?1",
+        [&organization_id],
+    )
+    .map_err(|e| e.to_string())?;
+    tx.execute(
+        "DELETE FROM guardian_fleet_rollout WHERE organization_id=?1",
+        [&organization_id],
+    )
+    .map_err(|e| e.to_string())?;
+    for (endpoint, agent, observed, status, seen) in [
+        (
+            "finance-01",
+            healthy_agent,
+            Some(policy.clone()),
+            "healthy",
+            Some(now.clone()),
+        ),
+        (
+            "support-01",
+            drifted_agent,
+            Some(drifted_policy),
+            "drifted",
+            Some(now.clone()),
+        ),
+        ("offline-01", offline_agent, None, "offline", None),
+    ] {
+        tx.execute(
+            "INSERT INTO guardian_fleet_endpoint(organization_id,endpoint_id,agent_pubkey,expected_policy_hash,observed_policy_hash,status,last_seen_at) VALUES(?1,?2,?3,?4,?5,?6,?7)",
+            params![organization_id, endpoint, agent, policy, observed, status, seen],
+        ).map_err(|e| format!("failed to seed simulated endpoint: {e}"))?;
+    }
+    tx.execute(
+        "INSERT INTO guardian_fleet_rollout(organization_id,rollout_id,policy_hash,state,endpoint_ids_json,wave_size,next_index,owner_approved_at,security_approved_at,created_at) VALUES(?1,?2,?3,'deployed',?4,1,3,?5,?5,?5)",
+        params![organization_id, rollout_id, policy, endpoints, now],
+    ).map_err(|e| format!("failed to seed simulated rollout: {e}"))?;
+    audit(&tx, &organization_id, "seed_simulation", &owner, rollout_id)?;
+    tx.commit().map_err(|e| e.to_string())?;
+    read_fleet(&connection, &organization_id)
 }
 
 #[tauri::command]
@@ -495,7 +569,15 @@ pub fn report_guardian_fleet_endpoint(
     let endpoint = token(&input.endpoint_id, "endpoint id")?;
     let observed = pubkey(&input.observed_policy_hash)?;
     let connection = open(&app)?;
-    let expected:Option<String>=connection.query_row("SELECT expected_policy_hash FROM guardian_fleet_endpoint WHERE organization_id=?1 AND endpoint_id=?2",params![org,endpoint],|r|r.get(0)).optional().map_err(|e|e.to_string())?.ok_or_else(||"endpoint was not found in this organization".to_string())?;
+    let (expected, reporting_agent): (Option<String>, String) = connection
+        .query_row(
+            "SELECT expected_policy_hash,agent_pubkey FROM guardian_fleet_endpoint WHERE organization_id=?1 AND endpoint_id=?2",
+            params![org, endpoint],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "endpoint was not found in this organization".to_string())?;
     let rollout_binding: Option<(String, String)> = connection
         .query_row(
             "SELECT policy_hash,endpoint_ids_json FROM guardian_fleet_rollout WHERE organization_id=?1 AND rollout_id=?2",
@@ -521,7 +603,7 @@ pub fn report_guardian_fleet_endpoint(
         &connection,
         &org,
         &format!("endpoint_{status}"),
-        &endpoint,
+        &reporting_agent,
         &rollout,
     )?;
     read_fleet(&connection, &org)

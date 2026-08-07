@@ -90,6 +90,7 @@ import { UpdateChecker } from "../UpdateChecker";
 import { SettingsSectionHeader } from "./SettingsSectionHeader";
 import { VoiceSettingsCard } from "./VoiceSettingsCard";
 import { GuardianNumbatSettingsCard } from "./GuardianNumbatSettingsCard";
+import { GuardianFleetSettingsCard } from "./GuardianFleetSettingsCard";
 
 export type SettingsSection =
   | "profile"
@@ -878,6 +879,7 @@ export function renderSettingsSection(
         <div className="space-y-12">
           <PreventSleepSettingsCard />
           <GuardianNumbatSettingsCard />
+          <GuardianFleetSettingsCard currentPubkey={props.currentPubkey} />
           <HarnessesSettingsPanel />
           <AgentDefaultsSettingsCard />
         </div>
