@@ -121,7 +121,7 @@ fn numbat_dir(app: &AppHandle) -> Result<PathBuf, String> {
     Ok(managed_agents_base_dir(app)?.join("numbat"))
 }
 
-fn numbat_findings_path(app: &AppHandle, agent_pubkey: &str) -> Result<PathBuf, String> {
+pub(crate) fn numbat_findings_path(app: &AppHandle, agent_pubkey: &str) -> Result<PathBuf, String> {
     validate_agent_pubkey(agent_pubkey)?;
     Ok(numbat_dir(app)?.join(format!("{agent_pubkey}.ndjson")))
 }

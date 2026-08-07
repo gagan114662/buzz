@@ -75,6 +75,8 @@ pub struct CancelGuardianSuppressionInput {
 pub struct ExportGuardianCaseInput {
     case_id: String,
     profile: String,
+    destination_label: Option<String>,
+    owner_confirmed_secrets: Option<bool>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -867,8 +869,21 @@ pub fn export_guardian_case_bundle(
     input: ExportGuardianCaseInput,
 ) -> Result<Vec<u8>, String> {
     validate_identifier(&input.case_id, "case id")?;
-    if !matches!(input.profile.as_str(), "redacted" | "regression") {
-        return Err("full forensic export requires a fresh destination-specific owner confirmation and is not available from this command".into());
+    if !matches!(input.profile.as_str(), "redacted" | "regression" | "full") {
+        return Err("invalid Guardian case export profile".into());
+    }
+    if input.profile == "full" {
+        if input.owner_confirmed_secrets != Some(true) {
+            return Err(
+                "full forensic export requires fresh confirmation that secrets may be present"
+                    .into(),
+            );
+        }
+        validate_text_label(
+            input.destination_label.as_deref().unwrap_or_default(),
+            "export destination",
+            160,
+        )?;
     }
     let connection = open_store(&app)?;
     let case = read_case_projection(&connection, &input.case_id)?;
@@ -900,7 +915,7 @@ pub fn export_guardian_case_bundle(
             .map_err(|error| format!("failed to read Guardian export finding: {error}"))?;
         findings.push(finding);
     }
-    let payload = if input.profile == "redacted" {
+    let payload = if input.profile == "redacted" || input.profile == "full" {
         serde_json::json!({ "case": case, "findings": findings })
     } else {
         serde_json::json!({
@@ -910,14 +925,47 @@ pub fn export_guardian_case_bundle(
             })).collect::<Vec<_>>()
         })
     };
-    let entry_name = if input.profile == "redacted" {
+    let entry_name = if input.profile == "redacted" || input.profile == "full" {
         "case.json"
     } else {
         "fixture.json"
     };
     let payload_bytes = serde_json::to_vec_pretty(&payload)
         .map_err(|error| format!("failed to encode Guardian export payload: {error}"))?;
-    let files = vec![(entry_name.to_string(), payload_bytes)];
+    let mut files = vec![(entry_name.to_string(), payload_bytes)];
+    if input.profile == "full" {
+        let finding_ids = case
+            .finding_ids
+            .iter()
+            .cloned()
+            .collect::<std::collections::HashSet<_>>();
+        let path = super::numbat_findings::numbat_findings_path(&app, &agent_pubkey)?;
+        let bytes = std::fs::read(&path)
+            .map_err(|error| format!("failed to read local Numbat forensic evidence: {error}"))?;
+        if bytes.len() > 8 * 1024 * 1024 {
+            return Err("local Numbat forensic evidence exceeds the 8 MiB export limit".into());
+        }
+        let mut selected = Vec::new();
+        for line in bytes.split(|byte| *byte == b'\n') {
+            if line.is_empty() {
+                continue;
+            }
+            let value: serde_json::Value = serde_json::from_slice(line)
+                .map_err(|error| format!("local Numbat forensic evidence is invalid: {error}"))?;
+            if value
+                .get("finding_id")
+                .and_then(|item| item.as_str())
+                .is_some_and(|finding_id| finding_ids.contains(finding_id))
+            {
+                selected.extend_from_slice(line);
+                selected.push(b'\n');
+            }
+        }
+        if selected.is_empty() {
+            return Err("no immutable local Numbat evidence remains for this case".into());
+        }
+        files.push(("evidence.ndjson".into(), selected));
+    }
     let file_manifest = files
         .iter()
         .map(|(name, bytes)| {
@@ -934,6 +982,7 @@ pub fn export_guardian_case_bundle(
         "caseId": input.case_id,
         "sourceEndpointPseudonym": endpoint_pseudonym,
         "createdAt": Utc::now().to_rfc3339(),
+        "destinationLabel": input.destination_label,
         "files": file_manifest,
     });
     let manifest = serde_json::to_vec_pretty(&manifest_value)
@@ -966,6 +1015,15 @@ pub fn export_guardian_case_bundle(
         &now,
     )?;
     Ok(bundle)
+}
+
+fn validate_text_label(value: &str, label: &str, max: usize) -> Result<(), String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() || trimmed.chars().count() > max || trimmed.chars().any(char::is_control)
+    {
+        return Err(format!("invalid {label}"));
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -1015,7 +1073,7 @@ pub fn import_guardian_case_bundle(
     let profile = manifest
         .get("profile")
         .and_then(|value| value.as_str())
-        .filter(|value| matches!(*value, "redacted" | "regression"))
+        .filter(|value| matches!(*value, "redacted" | "regression" | "full"))
         .ok_or_else(|| "invalid Guardian bundle profile".to_string())?;
     let case_id = manifest
         .get("caseId")

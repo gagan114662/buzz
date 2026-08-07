@@ -58,6 +58,11 @@ export function NumbatSecurityFindings({
     null,
   );
   const [suppressionReason, setSuppressionReason] = React.useState("");
+  const [fullExportCase, setFullExportCase] = React.useState<string | null>(
+    null,
+  );
+  const [fullExportDestination, setFullExportDestination] = React.useState("");
+  const [fullExportConfirmed, setFullExportConfirmed] = React.useState(false);
   const bundleImportRef = React.useRef<HTMLInputElement>(null);
 
   const refreshCases = React.useCallback(() => {
@@ -243,6 +248,93 @@ export function NumbatSecurityFindings({
                 >
                   Export fixture
                 </Button>
+                <Button
+                  data-testid="guardian-export-full-case"
+                  onClick={() => {
+                    setFullExportCase(item.caseId);
+                    setFullExportDestination("");
+                    setFullExportConfirmed(false);
+                  }}
+                  size="xs"
+                  type="button"
+                  variant="outline"
+                >
+                  Export full forensic
+                </Button>
+                {fullExportCase === item.caseId ? (
+                  <div
+                    className="w-full space-y-2 rounded-md border border-destructive/40 bg-destructive/5 p-2"
+                    data-testid="guardian-full-export-confirmation"
+                  >
+                    <p className="text-xs text-destructive">
+                      Full forensic evidence can contain secrets, exact
+                      timestamps, and sensitive local runtime details. Name the
+                      intended destination and confirm before the save dialog
+                      opens.
+                    </p>
+                    <Input
+                      aria-label="Full forensic export destination"
+                      maxLength={160}
+                      onChange={(event) =>
+                        setFullExportDestination(event.target.value)
+                      }
+                      placeholder="Destination, recipient, or support case"
+                      value={fullExportDestination}
+                    />
+                    <label className="flex items-start gap-2 text-xs">
+                      <input
+                        checked={fullExportConfirmed}
+                        onChange={(event) =>
+                          setFullExportConfirmed(event.target.checked)
+                        }
+                        type="checkbox"
+                      />
+                      I understand this bundle may contain secrets and authorize
+                      export to the named destination.
+                    </label>
+                    <div className="flex gap-2">
+                      <Button
+                        data-testid="guardian-confirm-full-export"
+                        disabled={
+                          !fullExportConfirmed ||
+                          fullExportDestination.trim().length < 3
+                        }
+                        onClick={() => {
+                          void saveGuardianCaseBundle(item.caseId, "full", {
+                            destinationLabel: fullExportDestination.trim(),
+                            ownerConfirmedSecrets: true,
+                          })
+                            .then((saved) => {
+                              if (saved) {
+                                toast.success("Full forensic bundle saved");
+                                setFullExportCase(null);
+                              }
+                            })
+                            .catch((cause: unknown) =>
+                              toast.error(
+                                cause instanceof Error
+                                  ? cause.message
+                                  : "Could not export forensic evidence",
+                              ),
+                            );
+                        }}
+                        size="xs"
+                        type="button"
+                        variant="destructive"
+                      >
+                        Confirm and choose file
+                      </Button>
+                      <Button
+                        onClick={() => setFullExportCase(null)}
+                        size="xs"
+                        type="button"
+                        variant="ghost"
+                      >
+                        Cancel
+                      </Button>
+                    </div>
+                  </div>
+                ) : null}
               </div>
             );
           })}

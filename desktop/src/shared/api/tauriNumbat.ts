@@ -57,7 +57,7 @@ export type GuardianSuppression = {
 
 export type GuardianCaseImportPreview = {
   schemaVersion: string;
-  profile: "redacted" | "regression";
+  profile: "redacted" | "regression" | "full";
   caseId: string;
   fileCount: number;
   verified: boolean;
@@ -172,10 +172,19 @@ export function cancelGuardianSuppression(
 
 export function saveGuardianCaseBundle(
   caseId: string,
-  profile: "redacted" | "regression",
+  profile: "redacted" | "regression" | "full",
+  confirmation?: {
+    destinationLabel: string;
+    ownerConfirmedSecrets: boolean;
+  },
 ): Promise<boolean> {
   return invokeTauri<boolean>("save_guardian_case_bundle", {
-    input: { caseId, profile },
+    input: {
+      caseId,
+      profile,
+      destinationLabel: confirmation?.destinationLabel,
+      ownerConfirmedSecrets: confirmation?.ownerConfirmedSecrets,
+    },
   });
 }
 
