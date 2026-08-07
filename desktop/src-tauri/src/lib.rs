@@ -688,6 +688,7 @@ pub fn run() {
             update_guardian_case_status,
             create_guardian_suppression,
             list_guardian_suppressions,
+            cancel_guardian_suppression,
             create_guardian_policy_draft,
             list_guardian_policy_versions,
             simulate_guardian_policy,

@@ -59,6 +59,13 @@ pub struct CreateGuardianSuppressionInput {
     expires_at: String,
 }
 
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CancelGuardianSuppressionInput {
+    suppression_id: String,
+    reason: String,
+}
+
 fn store_path(app: &AppHandle) -> Result<PathBuf, String> {
     Ok(managed_agents_base_dir(app)?.join("guardian-cases.sqlite3"))
 }
@@ -675,6 +682,87 @@ pub fn list_guardian_suppressions(
         .map_err(|error| format!("failed to list Guardian suppressions: {error}"))?;
     rows.map(|row| row.map_err(|error| format!("failed to read Guardian suppression: {error}")))
         .collect()
+}
+
+#[tauri::command]
+pub fn cancel_guardian_suppression(
+    app: AppHandle,
+    input: CancelGuardianSuppressionInput,
+) -> Result<GuardianSuppressionProjection, String> {
+    validate_identifier(&input.suppression_id, "suppression id")?;
+    let reason = input.reason.trim();
+    if reason.chars().count() < 3 || reason.chars().count() > 240 {
+        return Err("cancellation reason must contain 3 to 240 characters".into());
+    }
+    let mut connection = open_store(&app)?;
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(|error| format!("failed to begin Guardian suppression cancellation: {error}"))?;
+    let row: (String, i64, String, String, String, String) = transaction
+        .query_row(
+            "SELECT finding_id, version, reason, starts_at, expires_at, status
+             FROM guardian_suppression WHERE suppression_id = ?1",
+            [&input.suppression_id],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                ))
+            },
+        )
+        .map_err(|_| "Guardian suppression does not exist".to_string())?;
+    let (finding_id, version, prior_reason, starts_at, expires_at, status) = row;
+    if status != "active" {
+        return Err("only an active Guardian suppression can be cancelled".into());
+    }
+    let previous = serde_json::to_vec(&serde_json::json!({
+        "suppressionId": input.suppression_id,
+        "version": version,
+        "findingId": finding_id,
+        "reason": prior_reason,
+        "startsAt": starts_at,
+        "expiresAt": expires_at,
+        "status": status,
+    }))
+    .map_err(|error| format!("failed to encode Guardian suppression version: {error}"))?;
+    let previous_hash = hex::encode(Sha256::digest(previous));
+    let changed = transaction
+        .execute(
+            "UPDATE guardian_suppression SET version = ?2, status = 'cancelled',
+                    previous_version_hash = ?3
+             WHERE suppression_id = ?1 AND version = ?4 AND status = 'active'",
+            params![input.suppression_id, version + 1, previous_hash, version],
+        )
+        .map_err(|error| format!("failed to cancel Guardian suppression: {error}"))?;
+    if changed != 1 {
+        return Err("Guardian suppression changed while it was being cancelled".into());
+    }
+    let actor = owner_pubkey(&app)?;
+    let now = Utc::now().to_rfc3339();
+    append_action(
+        &transaction,
+        Some(&finding_id),
+        None,
+        "suppression_cancelled",
+        &actor,
+        reason,
+        &now,
+    )?;
+    transaction
+        .commit()
+        .map_err(|error| format!("failed to commit Guardian suppression cancellation: {error}"))?;
+    Ok(GuardianSuppressionProjection {
+        suppression_id: input.suppression_id,
+        finding_id,
+        reason: prior_reason,
+        starts_at,
+        expires_at,
+        status: "cancelled".into(),
+    })
 }
 
 fn valid_case_transition(current: &str, next: &str) -> bool {

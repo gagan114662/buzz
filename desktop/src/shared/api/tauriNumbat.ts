@@ -52,7 +52,7 @@ export type GuardianSuppression = {
   reason: string;
   startsAt: string;
   expiresAt: string;
-  status: "active" | "expired";
+  status: "active" | "expired" | "cancelled";
 };
 
 export function getGuardianNumbatStatus(): Promise<GuardianNumbatStatus> {
@@ -150,5 +150,14 @@ export function listGuardianSuppressions(
 ): Promise<GuardianSuppression[]> {
   return invokeTauri<GuardianSuppression[]>("list_guardian_suppressions", {
     agentPubkey,
+  });
+}
+
+export function cancelGuardianSuppression(
+  suppressionId: string,
+  reason: string,
+): Promise<GuardianSuppression> {
+  return invokeTauri<GuardianSuppression>("cancel_guardian_suppression", {
+    input: { suppressionId, reason },
   });
 }

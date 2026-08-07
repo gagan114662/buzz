@@ -4,6 +4,7 @@ import { toast } from "sonner";
 
 import {
   acknowledgeGuardianFinding,
+  cancelGuardianSuppression,
   createGuardianCase,
   createGuardianSuppression,
   listGuardianCases,
@@ -245,6 +246,42 @@ export function NumbatSecurityFindings({
                         ? "Acknowledged"
                         : "Acknowledge"}
                     </Button>
+                    {activeSuppression ? (
+                      <Button
+                        data-testid="guardian-cancel-suppression"
+                        disabled={pendingFinding === finding.findingId}
+                        onClick={() => {
+                          setPendingFinding(finding.findingId);
+                          void cancelGuardianSuppression(
+                            activeSuppression.suppressionId,
+                            "Owner restored alert notifications",
+                          )
+                            .then((cancelled) => {
+                              setSuppressions((current) =>
+                                current.map((item) =>
+                                  item.suppressionId === cancelled.suppressionId
+                                    ? cancelled
+                                    : item,
+                                ),
+                              );
+                              toast.success("Alert suppression cancelled");
+                            })
+                            .catch((cause: unknown) =>
+                              toast.error(
+                                cause instanceof Error
+                                  ? cause.message
+                                  : "Could not cancel suppression",
+                              ),
+                            )
+                            .finally(() => setPendingFinding(null));
+                        }}
+                        size="xs"
+                        type="button"
+                        variant="outline"
+                      >
+                        Restore alerts
+                      </Button>
+                    ) : null}
                     <Button
                       data-testid="guardian-create-case"
                       disabled={
