@@ -28,6 +28,7 @@ export function GuardianFleetSettingsCard({
   const [organizationId, setOrganizationId] = React.useState(
     () => window.localStorage.getItem(SAVED_ORGANIZATION_KEY) ?? "",
   );
+  const initialOrganizationId = React.useRef(organizationId);
   const [name, setName] = React.useState("");
   const [securityApprover, setSecurityApprover] = React.useState("");
   const [busy, setBusy] = React.useState(false);
@@ -52,10 +53,21 @@ export function GuardianFleetSettingsCard({
   };
 
   React.useEffect(() => {
-    if (!organizationId) return;
-    void run(() => getGuardianFleet(organizationId));
-    // Load the last selected organization only once on entry.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
+    const savedOrganizationId = initialOrganizationId.current;
+    if (!savedOrganizationId) return;
+    setBusy(true);
+    setError(null);
+    void getGuardianFleet(savedOrganizationId)
+      .then((savedFleet) => {
+        setFleet(savedFleet);
+        setOrganizationId(savedFleet.organizationId);
+        window.localStorage.setItem(
+          SAVED_ORGANIZATION_KEY,
+          savedFleet.organizationId,
+        );
+      })
+      .catch((cause: unknown) => setError(errorMessage(cause)))
+      .finally(() => setBusy(false));
   }, []);
 
   return (

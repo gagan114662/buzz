@@ -8,6 +8,7 @@ import {
   seedGuardianDurableRecoverySimulation,
   type DurableRecoveryView,
 } from "@/shared/api/tauriGuardianDurable";
+import { truncatePubkey } from "@/shared/lib/pubkey";
 import { Badge } from "@/shared/ui/badge";
 import { Button } from "@/shared/ui/button";
 import { SettingsOptionGroup, SettingsOptionRow } from "./SettingsOptionGroup";
@@ -98,7 +99,7 @@ export function GuardianDurableRecoverySettingsCard() {
                 </div>
                 <div className="text-xs text-muted-foreground">
                   Lease generation {view.lease?.generation ?? "none"} · actor{" "}
-                  {view.task.actor_pubkey.slice(0, 10)}…
+                  {truncatePubkey(view.task.actor_pubkey)}
                 </div>
               </div>
               <Badge>{view.recoveryState.replaceAll("_", " ")}</Badge>
