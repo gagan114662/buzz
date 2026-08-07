@@ -757,6 +757,14 @@ function GuardianPolicyWorkspace({ agentPubkey }: { agentPubkey: string }) {
       </div>
       <div className="mt-2 space-y-2">
         {policies.map((policy) => {
+          const rollbackTarget = policies.find(
+            (candidate) =>
+              candidate.policyHash !== policy.policyHash &&
+              candidate.simulationHash !== null &&
+              ["approved", "paused", "rolled_back", "active"].includes(
+                candidate.state,
+              ),
+          );
           const action =
             policy.state === "draft"
               ? "simulate"
@@ -830,7 +838,7 @@ function GuardianPolicyWorkspace({ agentPubkey }: { agentPubkey: string }) {
                 policy.state === "staged" ? (
                   <Button
                     data-testid="guardian-policy-rollback"
-                    disabled={busy !== null}
+                    disabled={busy !== null || !rollbackTarget}
                     onClick={() =>
                       run(
                         policy.policyHash,
@@ -838,6 +846,8 @@ function GuardianPolicyWorkspace({ agentPubkey }: { agentPubkey: string }) {
                           transitionGuardianPolicy(
                             policy.policyHash,
                             "rollback",
+                            undefined,
+                            rollbackTarget?.policyHash,
                           ),
                         "Policy rolled back",
                       )
@@ -846,7 +856,7 @@ function GuardianPolicyWorkspace({ agentPubkey }: { agentPubkey: string }) {
                     type="button"
                     variant="destructive"
                   >
-                    Roll back
+                    {rollbackTarget ? "Roll back" : "No verified rollback"}
                   </Button>
                 ) : null}
               </div>

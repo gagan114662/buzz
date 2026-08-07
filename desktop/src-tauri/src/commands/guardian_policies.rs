@@ -4,9 +4,15 @@ use chrono::Utc;
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use tauri::AppHandle;
+use tauri::{AppHandle, State};
 
-use crate::managed_agents::managed_agents_base_dir;
+use crate::{
+    app_state::AppState,
+    managed_agents::{
+        load_managed_agents, managed_agents_base_dir, restart_managed_agent_runtime,
+        save_managed_agents,
+    },
+};
 
 const SCHEMA_VERSION: &str = "guardian.policy/v1";
 const CORPUS_VERSION: &str = "guardian.policy-corpus/v1";
@@ -34,6 +40,7 @@ pub struct TransitionGuardianPolicyInput {
     action: String,
     target_agent_pubkey: Option<String>,
     approval_expires_at: Option<String>,
+    rollback_target_hash: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -360,6 +367,7 @@ fn next_state(state: &str, action: &str, simulation_passed: bool) -> Result<&'st
 #[tauri::command]
 pub fn transition_guardian_policy(
     app: AppHandle,
+    state: State<'_, AppState>,
     input: TransitionGuardianPolicyInput,
 ) -> Result<GuardianPolicyVersion, String> {
     let mut connection = open_store(&app)?;
@@ -367,6 +375,28 @@ pub fn transition_guardian_policy(
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(|error| format!("failed to begin Guardian policy transition: {error}"))?;
     let policy = read_policy(&transaction, &input.policy_hash)?;
+    let rollback_target = if input.action == "rollback" {
+        let target_hash = input
+            .rollback_target_hash
+            .as_deref()
+            .ok_or_else(|| "rollback must name an exact verified policy version".to_string())?;
+        let target = read_policy(&transaction, target_hash)?;
+        if target.policy_hash == policy.policy_hash
+            || target.agent_pubkey != policy.agent_pubkey
+            || target.simulation_hash.is_none()
+            || !matches!(
+                target.state.as_str(),
+                "approved" | "paused" | "rolled_back" | "active"
+            )
+        {
+            return Err(
+                "rollback target is not a different verified version for this agent".into(),
+            );
+        }
+        Some(target)
+    } else {
+        None
+    };
     if input.action == "approve" {
         let target = input
             .target_agent_pubkey
@@ -394,6 +424,15 @@ pub fn transition_guardian_policy(
         true
     };
     let to_state = next_state(&policy.state, &input.action, simulation_passed)?;
+    if to_state == "active" {
+        apply_runtime_policy(&app, &state, &policy)?;
+    } else if to_state == "rolled_back" {
+        apply_runtime_policy(
+            &app,
+            &state,
+            rollback_target.as_ref().expect("rollback target validated"),
+        )?;
+    }
     let now = Utc::now().to_rfc3339();
     let previous_hash: Option<String> = transaction
         .query_row(
@@ -409,6 +448,7 @@ pub fn transition_guardian_policy(
         "fromState": policy.state, "toState": to_state, "action": input.action,
         "targetAgentPubkey": input.target_agent_pubkey,
         "approvalExpiresAt": input.approval_expires_at,
+        "rollbackTargetHash": input.rollback_target_hash,
         "createdAt": now, "previousTransitionHash": previous_hash,
     }))
     .map_err(|error| format!("failed to encode Guardian policy transition: {error}"))?;
@@ -440,6 +480,66 @@ pub fn transition_guardian_policy(
         .map_err(|error| format!("failed to commit Guardian policy transition: {error}"))?;
     let connection = open_store(&app)?;
     read_policy(&connection, &input.policy_hash)
+}
+
+fn apply_runtime_policy(
+    app: &AppHandle,
+    state: &AppState,
+    policy: &GuardianPolicyVersion,
+) -> Result<(), String> {
+    let env_value = match policy.mode.as_str() {
+        "monitor" => "default",
+        "deny" => "dont-ask",
+        _ => return Err("Guardian policy has an unsupported runtime mode".into()),
+    };
+    let (previous_env, relay_url) = {
+        let _guard = state
+            .managed_agents_store_lock
+            .lock()
+            .map_err(|_| "managed-agent storage lock poisoned".to_string())?;
+        let mut records = load_managed_agents(app)?;
+        let record = records
+            .iter_mut()
+            .find(|record| record.pubkey.eq_ignore_ascii_case(&policy.agent_pubkey))
+            .ok_or_else(|| "policy target is not a locally managed agent".to_string())?;
+        let previous_env = record.env_vars.clone();
+        record
+            .env_vars
+            .insert("BUZZ_ACP_PERMISSION_MODE".into(), env_value.to_string());
+        let relay_url = crate::relay::effective_agent_relay_url(
+            &record.relay_url,
+            &crate::relay::relay_ws_url_with_override(state),
+        );
+        save_managed_agents(app, &records)?;
+        (previous_env, relay_url)
+    };
+    if let Err(error) =
+        restart_managed_agent_runtime(policy.agent_pubkey.clone(), relay_url.clone(), app.clone())
+    {
+        let restore_result = (|| {
+            let _guard = state
+                .managed_agents_store_lock
+                .lock()
+                .map_err(|_| "managed-agent storage lock poisoned".to_string())?;
+            let mut records = load_managed_agents(app)?;
+            let record = records
+                .iter_mut()
+                .find(|record| record.pubkey.eq_ignore_ascii_case(&policy.agent_pubkey))
+                .ok_or_else(|| "policy target disappeared during rollback".to_string())?;
+            record.env_vars = previous_env;
+            save_managed_agents(app, &records)
+        })();
+        let _ = restart_managed_agent_runtime(policy.agent_pubkey.clone(), relay_url, app.clone());
+        return match restore_result {
+            Ok(()) => Err(format!(
+                "policy activation failed and prior runtime configuration was restored: {error}"
+            )),
+            Err(restore_error) => Err(format!(
+                "policy activation failed ({error}); restoring prior configuration also failed ({restore_error})"
+            )),
+        };
+    }
+    Ok(())
 }
 
 #[cfg(test)]

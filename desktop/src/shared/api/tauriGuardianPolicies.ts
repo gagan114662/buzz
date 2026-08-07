@@ -79,6 +79,7 @@ export function transitionGuardianPolicy(
     | "rollback"
     | "abandon",
   approval?: { targetAgentPubkey: string; expiresAt: string },
+  rollbackTargetHash?: string,
 ): Promise<GuardianPolicyVersion> {
   return invokeTauri<GuardianPolicyVersion>("transition_guardian_policy", {
     input: {
@@ -86,6 +87,7 @@ export function transitionGuardianPolicy(
       action,
       targetAgentPubkey: approval?.targetAgentPubkey,
       approvalExpiresAt: approval?.expiresAt,
+      rollbackTargetHash,
     },
   });
 }
