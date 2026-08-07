@@ -13,6 +13,13 @@ import {
   type NumbatFinding,
   updateGuardianCaseStatus,
 } from "@/shared/api/tauriNumbat";
+import {
+  createGuardianPolicyDraft,
+  listGuardianPolicyVersions,
+  simulateGuardianPolicy,
+  transitionGuardianPolicy,
+  type GuardianPolicyVersion,
+} from "@/shared/api/tauriGuardianPolicies";
 import { Badge } from "@/shared/ui/badge";
 import { Button } from "@/shared/ui/button";
 import { Input } from "@/shared/ui/input";
@@ -77,6 +84,7 @@ export function NumbatSecurityFindings({
           <span>{health.detail}</span>
         </div>
       ) : null}
+      <GuardianPolicyWorkspace agentPubkey={agentPubkey} />
       {cases.length > 0 ? (
         <div className="space-y-2" data-testid="guardian-case-list">
           <p
@@ -374,5 +382,213 @@ export function NumbatSecurityFindings({
         </p>
       ) : null}
     </section>
+  );
+}
+
+const POLICY_OPERATIONS = [
+  "read",
+  "write",
+  "network",
+  "shell",
+  "browser",
+  "secrets",
+  "unknown-adapter",
+] as const;
+
+function GuardianPolicyWorkspace({ agentPubkey }: { agentPubkey: string }) {
+  const [policies, setPolicies] = React.useState<GuardianPolicyVersion[]>([]);
+  const [busy, setBusy] = React.useState<string | null>(null);
+
+  const refresh = React.useCallback(() => {
+    void listGuardianPolicyVersions(agentPubkey)
+      .then(setPolicies)
+      .catch(() => undefined);
+  }, [agentPubkey]);
+
+  React.useEffect(refresh, [refresh]);
+
+  const run = (
+    policyHash: string,
+    work: () => Promise<unknown>,
+    success: string,
+  ) => {
+    setBusy(policyHash);
+    void work()
+      .then(() => {
+        toast.success(success);
+        refresh();
+      })
+      .catch((cause: unknown) =>
+        toast.error(
+          cause instanceof Error ? cause.message : "Policy action failed",
+        ),
+      )
+      .finally(() => setBusy(null));
+  };
+
+  return (
+    <details
+      className="rounded-lg border border-border/70 bg-muted/20 px-3 py-2"
+      data-testid="guardian-policy-workspace"
+    >
+      <summary className="cursor-pointer text-xs font-semibold">
+        Versioned policy workspace
+      </summary>
+      <p className="mt-2 text-xs text-muted-foreground">
+        Drafts are immutable. Deny policies must pass every local simulation
+        partition before approval. Rollout is limited to this local agent until
+        organization trust is configured.
+      </p>
+      <div className="mt-2 flex flex-wrap gap-2">
+        <Button
+          data-testid="guardian-create-monitor-policy"
+          onClick={() =>
+            run(
+              "new-monitor",
+              () =>
+                createGuardianPolicyDraft(
+                  agentPubkey,
+                  `Monitor ${new Date().toISOString().slice(0, 10)}`,
+                  "monitor",
+                  POLICY_OPERATIONS.map((operation) => ({
+                    operation,
+                    decision: "allow" as const,
+                  })),
+                ),
+              "Monitor policy draft created",
+            )
+          }
+          size="xs"
+          type="button"
+          variant="outline"
+        >
+          New monitor draft
+        </Button>
+        <Button
+          data-testid="guardian-create-deny-policy"
+          onClick={() =>
+            run(
+              "new-deny",
+              () =>
+                createGuardianPolicyDraft(
+                  agentPubkey,
+                  `Lockdown ${new Date().toISOString().slice(0, 10)}`,
+                  "deny",
+                  POLICY_OPERATIONS.map((operation) => ({
+                    operation,
+                    decision:
+                      operation === "read" ? ("allow" as const) : "deny",
+                  })),
+                ),
+              "Lockdown policy draft created",
+            )
+          }
+          size="xs"
+          type="button"
+          variant="outline"
+        >
+          New lockdown draft
+        </Button>
+      </div>
+      <div className="mt-2 space-y-2">
+        {policies.map((policy) => {
+          const action =
+            policy.state === "draft"
+              ? "simulate"
+              : policy.state === "simulated"
+                ? "request_approval"
+                : policy.state === "awaiting_approval"
+                  ? "approve"
+                  : policy.state === "approved"
+                    ? "stage_local_canary"
+                    : policy.state === "staged" || policy.state === "paused"
+                      ? "activate"
+                      : policy.state === "active"
+                        ? "pause"
+                        : null;
+          return (
+            <div
+              className="flex flex-wrap items-center justify-between gap-2 rounded-md border border-border/60 px-2 py-2"
+              data-policy-hash={policy.policyHash}
+              key={policy.policyHash}
+            >
+              <div className="min-w-0">
+                <p className="truncate text-xs font-medium">{policy.name}</p>
+                <p className="text-xs text-muted-foreground">
+                  {policy.mode} · {policy.state.replaceAll("_", " ")} ·{" "}
+                  {policy.policyHash.slice(0, 10)}
+                </p>
+              </div>
+              <div className="flex gap-1">
+                {action ? (
+                  <Button
+                    data-testid="guardian-policy-next-action"
+                    disabled={busy !== null}
+                    onClick={() => {
+                      if (action === "simulate") {
+                        run(
+                          policy.policyHash,
+                          () => simulateGuardianPolicy(policy.policyHash),
+                          "Policy simulation complete",
+                        );
+                        return;
+                      }
+                      const approval =
+                        action === "approve"
+                          ? {
+                              targetAgentPubkey: agentPubkey,
+                              expiresAt: new Date(
+                                Date.now() + 7 * 24 * 60 * 60 * 1000,
+                              ).toISOString(),
+                            }
+                          : undefined;
+                      run(
+                        policy.policyHash,
+                        () =>
+                          transitionGuardianPolicy(
+                            policy.policyHash,
+                            action,
+                            approval,
+                          ),
+                        `Policy moved to ${action.replaceAll("_", " ")}`,
+                      );
+                    }}
+                    size="xs"
+                    type="button"
+                    variant="outline"
+                  >
+                    {action.replaceAll("_", " ")}
+                  </Button>
+                ) : null}
+                {policy.state === "active" ||
+                policy.state === "paused" ||
+                policy.state === "staged" ? (
+                  <Button
+                    data-testid="guardian-policy-rollback"
+                    disabled={busy !== null}
+                    onClick={() =>
+                      run(
+                        policy.policyHash,
+                        () =>
+                          transitionGuardianPolicy(
+                            policy.policyHash,
+                            "rollback",
+                          ),
+                        "Policy rolled back",
+                      )
+                    }
+                    size="xs"
+                    type="button"
+                    variant="destructive"
+                  >
+                    Roll back
+                  </Button>
+                ) : null}
+              </div>
+            </div>
+          );
+        })}
+      </div>
+    </details>
   );
 }
