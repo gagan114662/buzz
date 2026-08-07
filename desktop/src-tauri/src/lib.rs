@@ -1,23 +1,30 @@
 #![recursion_limit = "256"] // Deep Tauri command futures exceed the default layout query depth.
+mod app_menu;
 mod app_state;
 mod archive;
 mod builderlab;
 mod commands;
 mod deep_link;
+mod durable_tasks;
 mod egress_guard;
 mod event_sync;
 mod events;
 pub mod guardian_distribution;
 mod huddle;
 mod identity_storage;
+mod initial_window;
 mod key_backup;
 mod linux_media;
+#[cfg(target_os = "macos")]
+mod macos_notifications;
 mod managed_agents;
 mod media_proxy;
 #[cfg(feature = "mesh-llm")]
 mod mesh_llm;
 #[cfg(not(feature = "mesh-llm"))]
 mod mesh_llm_stubs;
+#[cfg(feature = "mesh-llm")]
+mod mesh_runtime;
 mod migration;
 #[cfg(test)]
 mod model_tests;
@@ -33,6 +40,9 @@ mod reset;
 mod secret_store;
 mod shutdown;
 mod templates;
+mod terminal_runtime;
+#[cfg_attr(not(test), allow(dead_code))]
+mod terminal_transport;
 #[cfg(target_os = "macos")]
 mod tray_menu;
 mod util;
@@ -50,11 +60,14 @@ use huddle::audio_output::{
 };
 use huddle::reconnect::reconnect_huddle_audio;
 use huddle::{
-    add_agent_to_huddle, check_pipeline_hotstart, confirm_huddle_active, download_voice_models,
-    end_huddle, get_huddle_agent_pubkeys, get_huddle_state, get_model_status, get_voice_input_mode,
-    join_huddle, leave_huddle, push_audio_pcm, set_huddle_transcription_enabled, set_tts_enabled,
-    set_voice_input_mode, speak_agent_message, start_huddle, start_stt_pipeline,
+    add_agent_to_huddle, check_pipeline_hotstart, close_huddle_companion, confirm_huddle_active,
+    download_voice_models, end_huddle, get_huddle_agent_pubkeys, get_huddle_state,
+    get_model_status, get_voice_input_mode, interrupt_huddle_speech, join_huddle, leave_huddle,
+    open_huddle_window, push_audio_pcm, remove_agent_from_huddle, set_huddle_manual_mic_unmuted,
+    set_huddle_transcription_enabled, set_tts_enabled, set_voice_input_mode, speak_agent_message,
+    start_huddle, start_stt_pipeline, HuddlePhase,
 };
+use initial_window::*;
 use managed_agents::{
     backfill_persona_snapshots, ensure_nest, list_managed_agent_runtimes,
     put_managed_agent_runtime_lifecycle, reconcile_managed_agent_runtimes,
@@ -67,105 +80,17 @@ use mesh_llm_stubs::*;
 use shutdown::{hard_exit_after_mesh_shutdown, relaunch_after_mesh_shutdown};
 use shutdown::{is_restart_request, shut_down_app};
 use std::sync::{atomic::AtomicBool, atomic::Ordering, Arc};
-use tauri::{Emitter, Manager, RunEvent};
 #[cfg(target_os = "macos")]
-use tauri::{Listener, WindowEvent};
+use tauri::Listener;
+use tauri::{Emitter, Manager, RunEvent, WindowEvent};
 use tauri_plugin_window_state::StateFlags;
 #[cfg(target_os = "macos")]
 use tray_menu::show_main_window;
 
-#[cfg(target_os = "macos")]
-const INITIAL_RENDER_READY_EVENT: &str = "initial-render-ready";
-
-fn reveal_initial_window<R: tauri::Runtime>(window: &tauri::Window<R>) {
-    if let Err(error) = window.show() {
-        eprintln!("buzz-desktop: failed to reveal main window: {error}");
-        return;
-    }
-    if let Err(error) = window.set_focus() {
-        eprintln!("buzz-desktop: failed to focus main window: {error}");
-    }
-}
-
-#[cfg(target_os = "macos")]
-fn set_initial_window_backing<R: tauri::Runtime>(window: &tauri::Window<R>) {
-    // Use opaque native backing only for the first frames so the previous app cannot show through.
-    if let Err(error) = window.set_background_color(Some(tauri::window::Color(17, 21, 24, 255))) {
-        eprintln!("buzz-desktop: failed to set initial window backing: {error}");
-    }
-}
-
-#[cfg(target_os = "macos")]
-async fn clear_initial_window_backing<R: tauri::Runtime>(window: &tauri::Window<R>) {
-    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-    if let Err(error) = window.set_background_color(None) {
-        eprintln!("buzz-desktop: failed to clear initial window backing: {error}");
-    }
-}
-
-#[cfg(target_os = "macos")]
-async fn wait_for_stable_initial_window_geometry<R: tauri::Runtime>(window: &tauri::Window<R>) {
-    const MAX_POLLS: usize = 120;
-    const REQUIRED_STABLE_POLLS: usize = 4;
-
-    let mut previous_bounds = None;
-    let mut stable_polls = 0;
-
-    for _ in 0..MAX_POLLS {
-        // Accept whatever geometry the window-state plugin restores — maximized
-        // or a normal saved size. macOS applies the restore asynchronously, so
-        // we only need consecutive identical outer bounds to know it settled.
-        // Gating on `is_maximized()` here would leave `bounds` permanently
-        // `None` for restored non-maximized windows and stall the reveal until
-        // the poll timeout.
-        let bounds = match (window.outer_position(), window.outer_size()) {
-            (Ok(position), Ok(size)) => Some((position.x, position.y, size.width, size.height)),
-            _ => None,
-        };
-
-        if bounds.is_some() && bounds == previous_bounds {
-            stable_polls += 1;
-            if stable_polls >= REQUIRED_STABLE_POLLS {
-                return;
-            }
-        } else {
-            stable_polls = 0;
-        }
-        previous_bounds = bounds;
-
-        tokio::time::sleep(std::time::Duration::from_millis(16)).await;
-    }
-
-    eprintln!("buzz-desktop: initial window geometry did not settle before reveal timeout");
-}
-
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    // mesh-llm's async chains overflow tokio's default 2 MiB worker stacks.
-    // Match upstream's 8 MiB stacks before anything touches tauri::async_runtime.
     #[cfg(feature = "mesh-llm")]
-    match tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .thread_stack_size(crate::mesh_llm::MESH_WORKER_STACK_SIZE)
-        .build()
-    {
-        Ok(runtime) => {
-            tauri::async_runtime::set(runtime.handle().clone());
-            // Keep the runtime alive for the process lifetime; dropping it
-            // would shut down the workers Tauri now depends on.
-            std::mem::forget(runtime);
-            eprintln!(
-                "buzz-mesh: installed tokio runtime with {} MiB worker stacks",
-                crate::mesh_llm::MESH_WORKER_STACK_SIZE / (1024 * 1024)
-            );
-        }
-        Err(error) => {
-            // Fall back to Tauri's default runtime: the app still works,
-            // only deep mesh-llm futures are at risk of stack overflow.
-            eprintln!("buzz-mesh: failed to build big-stack tokio runtime, using default: {error}");
-        }
-    }
-
+    mesh_runtime::install();
     let builder = tauri::Builder::default()
         .plugin(tauri_plugin_single_instance::init(|app, argv, _cwd| {
             // Focus the existing window when a duplicate instance launches.
@@ -347,10 +272,7 @@ pub fn run() {
         builder.plugin(tauri_plugin_updater::Builder::new().build())
     };
 
-    #[cfg(not(buzz_updater_enabled))]
-    let builder = builder;
-
-    let app = builder
+    let app = app_menu::install(builder)
         .register_asynchronous_uri_scheme_protocol("buzz-media", |ctx, request, responder| {
             let app = ctx.app_handle().clone();
             tauri::async_runtime::spawn(async move {
@@ -364,10 +286,14 @@ pub fn run() {
         .manage(BuilderlabSession::default())
         .manage(BuilderlabLogin::default())
         .manage(commands::pairing::PairingHandle::new())
+        .manage(terminal_runtime::TerminalSessions::default())
         .setup(move |app| {
             let app_handle = app.handle().clone();
             #[cfg(target_os = "macos")]
-            tray_menu::init(&app_handle)?;
+            {
+                tray_menu::init(&app_handle)?;
+                macos_notifications::init(&app_handle)?;
+            }
 
             // ── Phase 2: boot-time sentinel wipe ──────────────────────────────
             // Must run before migrations and identity resolution so the wipe
@@ -388,14 +314,17 @@ pub fn run() {
             };
 
             if reset_outcome.failed {
-                // Skip identity resolution and setup, but load the webview so the frontend can
-                // show the recovery screen via get_identity.
+                // Surface reset-failed state — skip identity resolution and
+                // all side-effecting setup. The webview still loads so the
+                // frontend can show the recovery screen via get_identity.
                 let state = app_handle.state::<AppState>();
                 state
                     .reset_failed
                     .store(true, std::sync::atomic::Ordering::Release);
                 return Ok(());
             }
+
+            // Run all pre-identity data migrations before state loads from disk.
             if reset_outcome.completed {
                 migration::run_boot_migrations_after_reset(&app_handle);
             } else {
@@ -648,10 +577,18 @@ pub fn run() {
                     }
                 });
             }
-
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            terminal_runtime::terminal_attach,
+            terminal_runtime::terminal_detach,
+            terminal_runtime::terminal_close,
+            terminal_runtime::terminal_input,
+            terminal_runtime::terminal_resize,
+            terminal_runtime::terminal_scroll,
+            terminal_runtime::terminal_ack,
+            terminal_runtime::terminal_viewport_ready,
+            terminal_runtime::terminal_focus,
             take_pending_community_deep_link,
             acknowledge_pending_community_deep_link,
             start_builderlab_login,
@@ -725,6 +662,22 @@ pub fn run() {
             decrypt_observer_event,
             build_observer_control_event,
             read_numbat_findings,
+            acknowledge_guardian_finding,
+            create_guardian_case,
+            list_guardian_cases,
+            update_guardian_case_status,
+            create_guardian_suppression,
+            list_guardian_suppressions,
+            cancel_guardian_suppression,
+            commands::guardian_cases::guardian_case_bundles::export_guardian_case_bundle,
+            commands::guardian_cases::guardian_case_bundles::save_guardian_case_bundle,
+            commands::guardian_cases::guardian_case_bundles::import_guardian_case_bundle,
+            create_guardian_policy_draft,
+            list_guardian_policy_versions,
+            simulate_guardian_policy,
+            transition_guardian_policy,
+            configure_guardian_fleet, get_guardian_fleet, seed_guardian_fleet_simulation, register_guardian_fleet_endpoint, create_guardian_fleet_rollout, approve_guardian_fleet_rollout, advance_guardian_fleet_rollout, report_guardian_fleet_endpoint, set_guardian_fleet_emergency_stop, seed_guardian_durable_recovery_simulation, get_guardian_durable_recovery_simulation,
+            recover_guardian_durable_simulation, reconcile_guardian_durable_simulation, complete_guardian_durable_simulation, configure_guardian_macos_vm_sandbox, get_guardian_sandbox_status, validate_guardian_sandbox_profile,
             guardian_distribution::commands::get_guardian_numbat_status,
             guardian_distribution::commands::install_guardian_numbat,
             guardian_distribution::commands::cancel_guardian_numbat_install,
@@ -771,16 +724,25 @@ pub fn run() {
             remove_reaction,
             get_event,
             show_native_notification,
+            #[cfg(target_os = "macos")]
+            macos_notifications::take_pending_activations,
+            #[cfg(target_os = "macos")]
+            macos_notifications::notification_permission_state,
+            #[cfg(target_os = "macos")]
+            macos_notifications::request_notification_access,
             upload_media,
             pick_and_upload_media,
             pick_and_upload_image,
             upload_media_bytes,
+            upload_media_bytes_raw,
+            cancel_media_upload,
             download_image,
             save_png_data_url,
             download_file,
             fetch_media_bytes,
             copy_image_to_clipboard,
             copy_text_to_clipboard,
+            read_clipboard_text,
             fetch_snapshot_bytes,
             relay_requires_membership,
             list_relay_members,
@@ -811,6 +773,7 @@ pub fn run() {
             get_managed_agent_log,
             get_agent_models,
             discover_agent_models,
+            agent_access_owner_only,
             get_agent_config_surface,
             get_runtime_file_config,
             get_baked_build_env_keys,
@@ -882,6 +845,8 @@ pub fn run() {
             leave_huddle,
             end_huddle,
             get_huddle_state,
+            close_huddle_companion,
+            open_huddle_window,
             push_audio_pcm,
             reconnect_huddle_audio,
             start_stt_pipeline,
@@ -895,18 +860,26 @@ pub fn run() {
             huddle::tts_settings::preview_pocket_voice,
             huddle::tts_settings::import_pocket_voice,
             huddle::tts_settings::delete_pocket_voice,
+            huddle::agent_voice::ensure_huddle_agent_voice_settings,
+            huddle::agent_voice::set_huddle_agent_tts_enabled,
+            huddle::agent_voice::set_huddle_agent_voice,
             speak_agent_message,
+            interrupt_huddle_speech,
             add_agent_to_huddle,
+            remove_agent_from_huddle,
+            huddle::agents::sync_agents_to_active_huddle,
             check_pipeline_hotstart,
             confirm_huddle_active,
             perform_sidebar_default_haptic,
             get_huddle_agent_pubkeys,
             set_voice_input_mode,
             get_voice_input_mode,
+            set_huddle_manual_mic_unmuted,
             list_audio_output_devices,
             set_audio_output_device,
             get_audio_output_device,
             start_pairing,
+            start_identity_recovery_pairing,
             confirm_pairing_sas,
             cancel_pairing,
             apply_workspace,
@@ -916,6 +889,7 @@ pub fn run() {
             fetch_join_policy,
             set_prevent_sleep_active,
             get_agent_memory,
+            review_agent_memory_proposal,
             relay_reconnect_hook,
             relay_reconnect_hook_configured,
             observer_archive_default_enabled,
@@ -930,6 +904,11 @@ pub fn run() {
             archive::read_archived_observer_events_for_channel,
             archive::index_observer_channel_id,
             archive::read_unindexed_observer_rows,
+            archive::shepherd::import_shepherd_evidence,
+            archive::shepherd::read_shepherd_evidence,
+            normalize_shepherd_trace,
+            shepherd_adapter_status,
+            settle_shepherd_run,
             archive::causal_ledger::read_causal_ledger,
             archive::causal_ledger::append_causal_ledger_entry,
             is_auto_update_supported,
@@ -945,7 +924,6 @@ pub fn run() {
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application");
-
     let shutdown_done = Arc::new(AtomicBool::new(false));
 
     #[cfg(unix)]
@@ -967,6 +945,29 @@ pub fn run() {
             if let Some(window) = app_handle.get_webview_window("main") {
                 if let Err(error) = window.hide() {
                     eprintln!("buzz-desktop: failed to hide main window: {error}");
+                }
+            }
+        }
+        RunEvent::WindowEvent {
+            label,
+            event: WindowEvent::CloseRequested { .. },
+            ..
+        } if label.starts_with("huddle-") => {
+            let is_active_huddle_window =
+                app_handle
+                    .state::<AppState>()
+                    .huddle()
+                    .ok()
+                    .is_some_and(|huddle| {
+                        !matches!(huddle.phase, HuddlePhase::Idle | HuddlePhase::Leaving)
+                            && huddle
+                                .ephemeral_channel_id
+                                .as_deref()
+                                .is_some_and(|channel_id| label == format!("huddle-{channel_id}"))
+                    });
+            if is_active_huddle_window {
+                if let Err(error) = app_handle.emit("huddle-companion-returned", ()) {
+                    eprintln!("buzz-desktop: failed to restore huddle drawer: {error}");
                 }
             }
         }

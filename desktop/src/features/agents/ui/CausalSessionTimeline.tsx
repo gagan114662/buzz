@@ -11,11 +11,11 @@ import {
 } from "lucide-react";
 import * as React from "react";
 
-import type { NumbatFinding } from "@/shared/api/tauriNumbat";
 import { Badge } from "@/shared/ui/badge";
 import { cn } from "@/shared/lib/cn";
 
 import type { ObserverEvent } from "./agentSessionTypes";
+import type { CausalFinding } from "./trustworthySessionTimeline";
 import { explainSession } from "./trustworthySessionTimeline";
 
 export function CausalSessionTimeline({
@@ -23,7 +23,7 @@ export function CausalSessionTimeline({
   findings,
 }: {
   events: readonly ObserverEvent[];
-  findings: readonly NumbatFinding[];
+  findings: readonly CausalFinding[];
 }) {
   const explanation = React.useMemo(
     () => explainSession(events, findings),

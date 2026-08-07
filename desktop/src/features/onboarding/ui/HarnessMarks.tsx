@@ -39,6 +39,23 @@ function CursorMark({ className }: MarkProps) {
   );
 }
 
+/// Open Interpreter's official monochrome ring (Apache-2.0).
+function OpenInterpreterMark({ className }: MarkProps) {
+  return (
+    <svg
+      aria-hidden="true"
+      className={className}
+      fill="none"
+      role="img"
+      shapeRendering="geometricPrecision"
+      viewBox="0 0 200 200"
+      xmlns="http://www.w3.org/2000/svg"
+    >
+      <circle cx="100" cy="100" r="92" stroke="currentColor" strokeWidth="4" />
+    </svg>
+  );
+}
+
 /// Theme-adaptive inline marks, keyed by runtime/preset id. Consulted before
 /// the bitmap logo maps in `RuntimeIcon`. Codex deliberately has no entry:
 /// the OpenAI blossom was removed from simple-icons v16 at the vendor's
@@ -46,4 +63,5 @@ function CursorMark({ className }: MarkProps) {
 export const RUNTIME_MARKS: Record<string, React.FC<MarkProps>> = {
   cursor: CursorMark,
   goose: GooseMark,
+  "open-interpreter": OpenInterpreterMark,
 };

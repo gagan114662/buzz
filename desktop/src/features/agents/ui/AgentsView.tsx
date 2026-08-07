@@ -37,6 +37,8 @@ import {
 } from "@/shared/ui/dropdown-menu";
 import { PageHeader } from "@/shared/ui/PageHeader";
 import { getInheritedAgentDefaults } from "./bakedEnvHelpers";
+import { OutcomeAssistantStarter } from "./OutcomeAssistantStarter";
+import type { CreatePersonaInput } from "@/shared/api/types";
 
 export function AgentsView() {
   const { openPersonaProfilePanel, openProfilePanel } = useProfilePanel();
@@ -53,9 +55,18 @@ export function AgentsView() {
   // Exclusivity: create never sets `personaDialogState` (edit/dup/import do),
   // so the create-mode and definition-edit AgentDialog mounts never coexist.
   const [isCreateDialogOpen, setIsCreateDialogOpen] = React.useState(false);
+  const [createInitialValues, setCreateInitialValues] =
+    React.useState<CreatePersonaInput | null>(null);
 
   function openUnifiedCreate() {
     personas.prepareCreate();
+    setCreateInitialValues(null);
+    setIsCreateDialogOpen(true);
+  }
+
+  function openOutcomeCreate(initialValues: CreatePersonaInput) {
+    personas.prepareCreate();
+    setCreateInitialValues(initialValues);
     setIsCreateDialogOpen(true);
   }
 
@@ -211,6 +222,7 @@ export function AgentsView() {
             description="Set up and manage your agents."
             title="Agents"
           />
+          <OutcomeAssistantStarter onStart={openOutcomeCreate} />
           <div className="flex flex-col gap-8">
             <UnifiedAgentsSection
               defaultModel={inheritedDefaults.model.value}
@@ -225,6 +237,7 @@ export function AgentsView() {
               isActionPending={isActionPending}
               isAgentsLoading={agents.managedAgentsQuery.isLoading}
               startingAgentPubkey={agents.startingAgentPubkey}
+              restartingAgentPubkey={agents.restartingAgentPubkey}
               startingPersonaIds={agents.startingPersonaIds}
               onOpenAgentProfile={(pubkey, options) => {
                 openProfilePanel?.(pubkey, options);
@@ -234,6 +247,9 @@ export function AgentsView() {
               }}
               onStartAgent={(pubkey) => {
                 void agents.handleStart(pubkey);
+              }}
+              onRestartAgent={(pubkey) => {
+                void agents.handleRestart(pubkey);
               }}
               onStartPersona={(persona) => {
                 void agents.handleStartPersona(persona);
@@ -307,6 +323,7 @@ export function AgentsView() {
 
       {isCreateDialogOpen ? (
         <AgentDialog
+          initialValues={createInitialValues}
           definitionError={
             personas.createPersonaMutation.error instanceof Error
               ? personas.createPersonaMutation.error
@@ -319,7 +336,13 @@ export function AgentsView() {
           }}
           onSubmitDefinition={personas.handleSubmit}
           runtimes={personas.acpRuntimesQuery.data ?? []}
-          runtimesLoading={personas.acpRuntimesQuery.isLoading}
+          runtimeCatalogStatus={
+            personas.acpRuntimesQuery.isLoading
+              ? "loading"
+              : personas.acpRuntimesQuery.isError
+                ? "error"
+                : "ready"
+          }
         />
       ) : null}
       {agents.agentToAddToChannel ? (
@@ -368,7 +391,13 @@ export function AgentsView() {
           isPending={personas.isPending}
           mode="definition-edit"
           runtimes={personas.acpRuntimesQuery.data ?? []}
-          runtimesLoading={personas.acpRuntimesQuery.isLoading}
+          runtimeCatalogStatus={
+            personas.acpRuntimesQuery.isLoading
+              ? "loading"
+              : personas.acpRuntimesQuery.isError
+                ? "error"
+                : "ready"
+          }
           onOpenChange={(open) => {
             if (!open) {
               personas.setPersonaDialogState(null);

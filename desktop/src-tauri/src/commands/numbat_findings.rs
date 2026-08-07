@@ -36,16 +36,16 @@ static NUMBAT_VERIFICATION_BASELINES: OnceLock<Mutex<HashMap<String, (u64, u64)>
 #[derive(Debug, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct NumbatFindingProjection {
-    finding_id: String,
-    rule_id: String,
-    title: String,
-    severity: String,
-    detected_at: String,
-    source_agent: String,
-    session_id: Option<String>,
-    channel_id: Option<String>,
-    turn_id: Option<String>,
-    evidence_count: usize,
+    pub(crate) finding_id: String,
+    pub(crate) rule_id: String,
+    pub(crate) title: String,
+    pub(crate) severity: String,
+    pub(crate) detected_at: String,
+    pub(crate) source_agent: String,
+    pub(crate) session_id: Option<String>,
+    pub(crate) channel_id: Option<String>,
+    pub(crate) turn_id: Option<String>,
+    pub(crate) evidence_count: usize,
 }
 
 #[derive(Debug, Serialize, PartialEq, Eq)]
@@ -121,7 +121,7 @@ fn numbat_dir(app: &AppHandle) -> Result<PathBuf, String> {
     Ok(managed_agents_base_dir(app)?.join("numbat"))
 }
 
-fn numbat_findings_path(app: &AppHandle, agent_pubkey: &str) -> Result<PathBuf, String> {
+pub(crate) fn numbat_findings_path(app: &AppHandle, agent_pubkey: &str) -> Result<PathBuf, String> {
     validate_agent_pubkey(agent_pubkey)?;
     Ok(numbat_dir(app)?.join(format!("{agent_pubkey}.ndjson")))
 }
@@ -130,7 +130,7 @@ fn numbat_findings_template(app: &AppHandle) -> Result<PathBuf, String> {
     Ok(numbat_dir(app)?.join("${BUZZ_MANAGED_AGENT_PUBKEY}.ndjson"))
 }
 
-fn previous_findings_path(path: &Path) -> PathBuf {
+pub(crate) fn previous_findings_path(path: &Path) -> PathBuf {
     path.with_extension("previous.ndjson")
 }
 
@@ -838,6 +838,8 @@ pub fn read_numbat_findings(
         batch.health = active_health();
         write_health(&app, &agent_pubkey, &batch.health);
     }
+    super::guardian_cases::persist_finding_projections(&app, &batch.findings)?;
+    super::guardian_cases::persist_finding_evidence(&app, &batch.findings)?;
     Ok(batch)
 }
 
@@ -845,4 +847,5 @@ pub fn read_numbat_findings(
 mod lifecycle_tests;
 
 #[cfg(test)]
+#[path = "numbat_findings_tests.rs"]
 mod tests;

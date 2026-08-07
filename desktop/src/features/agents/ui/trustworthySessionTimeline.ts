@@ -1,6 +1,20 @@
-import type { NumbatFinding } from "@/shared/api/tauriNumbat";
-
 import type { ObserverEvent } from "./agentSessionTypes";
+import {
+  extractPromptText,
+  extractToolResult,
+  parsePromptText,
+} from "./agentSessionTranscriptHelpers";
+import { asRecord, asString } from "./agentSessionUtils";
+
+export type CausalFinding = {
+  findingId: string;
+  detectedAt: string;
+  title: string;
+  ruleId: string;
+  evidenceCount: number;
+  sessionId: string | null;
+  turnId: string | null;
+};
 
 export type CausalEventClass = "fact" | "decision" | "inference" | "gap";
 export type CausalEventConfidence = "direct" | "correlated" | "unknown";
@@ -66,9 +80,159 @@ function observerEventId(event: ObserverEvent): string {
   return `observer:${event.sessionId ?? "unknown"}:${event.seq}`;
 }
 
-function projectObserverEvent(event: ObserverEvent): CausalTimelineEvent {
+function latestTurnEvents(
+  observerEvents: readonly ObserverEvent[],
+): ObserverEvent[] {
+  const latestTurn = [...observerEvents]
+    .reverse()
+    .find((event) => event.turnId);
+  if (!latestTurn?.turnId) return observerEvents as ObserverEvent[];
+  return observerEvents.filter(
+    (event) =>
+      event.turnId === latestTurn.turnId &&
+      (!latestTurn.sessionId || event.sessionId === latestTurn.sessionId),
+  );
+}
+
+function acpMethod(event: ObserverEvent): string | null {
+  return asString(objectPayload(event).method);
+}
+
+function acpUpdate(event: ObserverEvent): Record<string, unknown> {
+  const payload = objectPayload(event);
+  return asRecord(asRecord(payload.params).update);
+}
+
+function permissionDecisionFromRawEvent(
+  event: ObserverEvent,
+): { decision: string; denied: boolean } | null {
+  if (event.kind !== "acp_write" || acpMethod(event)) return null;
+  const result = asRecord(asRecord(objectPayload(event).result).outcome);
+  const outcome = asString(result.outcome);
+  if (!outcome) return null;
+  const optionId = asString(result.optionId);
+  const decision = optionId ?? outcome;
+  if (outcome !== "cancelled" && !/allow|reject|deny|cancel/.test(decision)) {
+    return null;
+  }
+  return {
+    decision,
+    denied:
+      outcome === "cancelled" ||
+      decision.includes("reject") ||
+      decision.includes("deny") ||
+      decision.includes("cancel"),
+  };
+}
+
+function toolResultFromRawEvent(
+  event: ObserverEvent,
+  observerEvents: readonly ObserverEvent[],
+): { detail: string; failed: boolean } | null {
+  if (event.kind !== "acp_read" || acpMethod(event) !== "session/update") {
+    return null;
+  }
+  const update = acpUpdate(event);
+  if (asString(update.sessionUpdate) !== "tool_call_update") return null;
+  const status = asString(update.status);
+  if (status !== "completed" && status !== "failed") return null;
+  const toolCallId = asString(update.toolCallId);
+  const earlierUpdate = toolCallId
+    ? [...observerEvents]
+        .reverse()
+        .map((candidate) => acpUpdate(candidate))
+        .find(
+          (candidateUpdate) =>
+            asString(candidateUpdate.sessionUpdate) === "tool_call_update" &&
+            asString(candidateUpdate.toolCallId) === toolCallId &&
+            Boolean(extractToolResult(candidateUpdate)),
+        )
+    : null;
+  const detail =
+    extractToolResult(update) ||
+    (earlierUpdate ? extractToolResult(earlierUpdate) : null) ||
+    `Tool ${status}.`;
+  return {
+    detail,
+    failed:
+      status === "failed" ||
+      /permission denied|operation not permitted/i.test(detail),
+  };
+}
+
+function taskFromEvents(events: readonly ObserverEvent[]): string | null {
+  const taskEvent = [...events]
+    .reverse()
+    .find((event) => event.kind === "task_captured");
+  if (taskEvent) {
+    const taskPayload = objectPayload(taskEvent);
+    return (
+      stringValue(taskPayload.description) ??
+      (stringValue(taskPayload.sourceMessageId)
+        ? `Task captured from message ${stringValue(taskPayload.sourceMessageId)}`
+        : null)
+    );
+  }
+
+  const promptEvent = [...events]
+    .reverse()
+    .find(
+      (event) =>
+        event.kind === "acp_write" && acpMethod(event) === "session/prompt",
+    );
+  if (!promptEvent) return null;
+  const prompt = extractPromptText(objectPayload(promptEvent));
+  if (!prompt) return null;
+  return parsePromptText(prompt).userText || prompt.trim() || null;
+}
+
+function projectObserverEvent(
+  event: ObserverEvent,
+  observerEvents: readonly ObserverEvent[],
+): CausalTimelineEvent {
   const payload = objectPayload(event);
   const eventId = observerEventId(event);
+
+  const rawPermissionDecision = permissionDecisionFromRawEvent(event);
+  if (rawPermissionDecision) {
+    return {
+      id: eventId,
+      timestamp: event.timestamp,
+      class: "decision",
+      title: rawPermissionDecision.denied
+        ? "Tool request denied"
+        : "Tool request allowed",
+      detail: `Buzz ACP answered ${rawPermissionDecision.decision}.`,
+      sourceSystem: "Buzz ACP",
+      sourceLayer: "acp_permission_gate",
+      observerRole: "enforced",
+      confidence: "direct",
+      sessionId: event.sessionId,
+      turnId: event.turnId,
+      evidenceIds: [eventId],
+    };
+  }
+
+  const rawToolResult = toolResultFromRawEvent(event, observerEvents);
+  if (rawToolResult) {
+    const permissionFailure =
+      rawToolResult.failed &&
+      /permission denied|operation not permitted/i.test(rawToolResult.detail);
+    return {
+      id: eventId,
+      timestamp: event.timestamp,
+      class: "fact",
+      title: rawToolResult.failed ? "Tool failed" : "Tool completed",
+      detail: rawToolResult.detail,
+      sourceSystem: permissionFailure ? "Operating-system sandbox" : "Buzz ACP",
+      sourceLayer: permissionFailure ? "os_sandbox" : "acp_tool_result",
+      observerRole: "observed",
+      confidence: "direct",
+      sessionId: event.sessionId,
+      turnId: event.turnId,
+      evidenceIds: [eventId],
+    };
+  }
 
   if (event.kind === "host_operation") {
     const operation = stringValue(payload.operation) ?? "Host operation";
@@ -167,7 +331,7 @@ function projectObserverEvent(event: ObserverEvent): CausalTimelineEvent {
   };
 }
 
-function projectFinding(finding: NumbatFinding): CausalTimelineEvent {
+function projectFinding(finding: CausalFinding): CausalTimelineEvent {
   return {
     id: `numbat:${finding.findingId}`,
     timestamp: finding.detectedAt,
@@ -186,12 +350,14 @@ function projectFinding(finding: NumbatFinding): CausalTimelineEvent {
 
 export function buildTrustworthySessionTimeline(
   observerEvents: readonly ObserverEvent[],
-  findings: readonly NumbatFinding[],
+  findings: readonly CausalFinding[],
 ): CausalTimelineEvent[] {
   if (observerEvents.length === 0 && findings.length === 0) return [];
 
   const projected = [
-    ...observerEvents.map(projectObserverEvent),
+    ...observerEvents.map((event) =>
+      projectObserverEvent(event, observerEvents),
+    ),
     ...findings.map(projectFinding),
   ];
   const seenLayers = new Set(projected.map((event) => event.sourceLayer));
@@ -231,18 +397,28 @@ export function buildTrustworthySessionTimeline(
 
 export function explainSession(
   observerEvents: readonly ObserverEvent[],
-  findings: readonly NumbatFinding[],
+  findings: readonly CausalFinding[],
 ): SessionExplanation | null {
-  const timeline = buildTrustworthySessionTimeline(observerEvents, findings);
+  const scopedEvents = latestTurnEvents(observerEvents);
+  const scopedTurnId = scopedEvents.find((event) => event.turnId)?.turnId;
+  const scopedFindings = scopedTurnId
+    ? findings.filter(
+        (finding) => !finding.turnId || finding.turnId === scopedTurnId,
+      )
+    : findings;
+  const timeline = buildTrustworthySessionTimeline(
+    scopedEvents,
+    scopedFindings,
+  );
   if (timeline.length === 0) return null;
 
   const latestError = [...timeline]
     .reverse()
     .find((event) => event.title === "Turn failed");
-  const latestCompleted = [...observerEvents]
+  const latestCompleted = [...scopedEvents]
     .reverse()
     .find((event) => event.kind === "turn_completed");
-  const latestStarted = [...observerEvents]
+  const latestStarted = [...scopedEvents]
     .reverse()
     .find((event) => event.kind === "turn_started");
   const strongestFinding = [...timeline]
@@ -262,18 +438,28 @@ export function explainSession(
     );
   const gaps = timeline.filter((event) => event.class === "gap");
   const facts = timeline.filter((event) => event.class !== "gap");
+  const latestToolFailure = [...timeline]
+    .reverse()
+    .find((event) => event.title === "Tool failed");
+  const latestToolSuccess = [...timeline]
+    .reverse()
+    .find((event) => event.title === "Tool completed");
 
-  const outcome: SessionOutcome = latestError
-    ? "failed"
-    : latestCompleted
-      ? "succeeded"
-      : latestStarted
-        ? "in_progress"
-        : "unknown";
+  const outcome: SessionOutcome =
+    latestError || latestToolFailure || deniedDecision
+      ? "failed"
+      : latestCompleted && latestToolSuccess
+        ? "succeeded"
+        : latestCompleted
+          ? "unknown"
+          : latestStarted
+            ? "in_progress"
+            : "unknown";
   const cause =
     causalHypothesis ??
     strongestFinding ??
     latestError ??
+    latestToolFailure ??
     deniedDecision ??
     null;
   const why = cause
@@ -290,15 +476,9 @@ export function explainSession(
         ? "medium"
         : "low";
 
-  const taskEvent = [...observerEvents]
-    .reverse()
-    .find((event) => event.kind === "task_captured");
-  const taskPayload = taskEvent ? objectPayload(taskEvent) : {};
   const task =
-    stringValue(taskPayload.description) ??
-    (stringValue(taskPayload.sourceMessageId)
-      ? `Task captured from message ${stringValue(taskPayload.sourceMessageId)}`
-      : "Task description unavailable from current session evidence");
+    taskFromEvents(scopedEvents) ??
+    "Task description unavailable from current turn evidence";
   const remedyEvent = [...observerEvents]
     .reverse()
     .find((event) => event.kind === "remediation_proposed");
@@ -346,13 +526,21 @@ export function explainSession(
         evidenceIds: replayEvent ? [observerEventId(replayEvent)] : [],
       }
     : null;
+  const causalEvidence = facts.filter(
+    (event) =>
+      event.class === "decision" ||
+      event.title === "Tool failed" ||
+      event.title === "Tool completed" ||
+      event.title === "Turn failed",
+  );
 
   return {
     task,
     outcome,
     why,
     confidence,
-    evidence: facts.slice(-5),
+    evidence:
+      causalEvidence.length > 0 ? causalEvidence.slice(-5) : facts.slice(-5),
     unknowns: gaps,
     nextAction:
       remediation?.status === "validated"

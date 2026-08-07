@@ -158,6 +158,32 @@ async function invokeTauri<T>(
   );
 }
 
+test("starts a job-shaped assistant from an outcome and minimum access", async ({
+  page,
+}) => {
+  await gotoApp(page);
+  await page.getByTestId("open-agents-view").click();
+
+  const starter = page.getByTestId("outcome-assistant-starter");
+  await expect(starter).toBeVisible();
+  await starter.getByTestId("outcome-preset-research").click();
+  await starter
+    .getByTestId("outcome-request")
+    .fill("Compare three vendors with sourced evidence");
+  await starter.getByLabel("Signed-in browser").check();
+  await starter.getByTestId("review-outcome-assistant").click();
+
+  const dialog = page.getByTestId("persona-dialog");
+  await expect(dialog).toBeVisible();
+  await expect(dialog.getByLabel("Agent name")).toHaveValue("Research Scout");
+  await expect(dialog.getByLabel("Agent instruction")).toHaveValue(
+    /Compare three vendors with sourced evidence/,
+  );
+  await expect(dialog.getByLabel("Agent instruction")).toHaveValue(
+    /buzz-completion-packet/,
+  );
+});
+
 async function invokeTauriExpectError(
   page: import("@playwright/test").Page,
   command: string,
@@ -2435,6 +2461,100 @@ test("personas referenced by teams cannot be deleted", async ({ page }) => {
   expect(error).toBe(
     "Analyst is still referenced by a team. Remove it from those teams first.",
   );
+});
+
+test("start pill morphs into the running dot without remounting the avatar", async ({
+  page,
+}) => {
+  const personaId = "custom:motion-auditor";
+  const pubkey = "ab".repeat(32);
+  const activeDotSize = 18;
+  await page.emulateMedia({ reducedMotion: "no-preference" });
+  await installMockBridge(page, {
+    personas: [
+      {
+        avatarUrl: emojiAvatarDataUrl("✨", "#7657FF"),
+        displayName: "Motion Auditor",
+        id: personaId,
+        systemPrompt: "You audit motion continuity.",
+      },
+    ],
+    managedAgents: [
+      {
+        name: "Motion Auditor",
+        personaId,
+        pubkey,
+        status: "stopped",
+      },
+    ],
+  });
+  await gotoApp(page);
+  await page.getByTestId("open-agents-view").click();
+
+  const card = page.getByTestId(`persona-agent-row-${personaId}`);
+  const startButton = page.getByTestId(`agent-runtime-start-${pubkey}`);
+  const badge = startButton.locator("xpath=../..");
+  const initialAvatar = await card
+    .getByAltText("Motion Auditor avatar")
+    .elementHandle();
+  expect(initialAvatar).not.toBeNull();
+
+  const samplesPromise = badge.evaluate(async (element) => {
+    const samples: Array<{
+      backgroundColor: string;
+      height: number;
+      width: number;
+    }> = [];
+    const startedAt = performance.now();
+
+    while (performance.now() - startedAt < 440) {
+      const bounds = element.getBoundingClientRect();
+      samples.push({
+        backgroundColor: getComputedStyle(element).backgroundColor,
+        height: bounds.height,
+        width: bounds.width,
+      });
+      await new Promise<void>((resolve) =>
+        requestAnimationFrame(() => resolve()),
+      );
+    }
+
+    return samples;
+  });
+
+  await page.waitForTimeout(32);
+  await startButton.click();
+  await expect(
+    page.getByTestId(`agent-runtime-active-${pubkey}`),
+  ).toBeVisible();
+  const samples = await samplesPromise;
+  const finalAvatar = await card
+    .getByAltText("Motion Auditor avatar")
+    .elementHandle();
+
+  expect(samples[0]?.width).toBeCloseTo(56, 0);
+  expect(samples[0]?.height).toBeCloseTo(36, 0);
+  expect(
+    samples.some(
+      (sample) =>
+        sample.width > activeDotSize &&
+        sample.width < 56 &&
+        sample.height > activeDotSize &&
+        sample.height < 36,
+    ),
+  ).toBe(true);
+  expect(samples.at(-1)?.width).toBeCloseTo(activeDotSize, 0);
+  expect(samples.at(-1)?.height).toBeCloseTo(activeDotSize, 0);
+  expect(samples.at(-1)?.backgroundColor).not.toBe(samples[0]?.backgroundColor);
+  await expect(
+    page.getByTestId(`agent-runtime-active-${pubkey}`).locator("xpath=../.."),
+  ).toHaveClass(/bg-emerald-500/);
+  expect(
+    await initialAvatar?.evaluate(
+      (before, after) => before === after,
+      finalAvatar,
+    ),
+  ).toBe(true);
 });
 
 test("duplicate instances move from the agents gallery into the agent profile", async ({

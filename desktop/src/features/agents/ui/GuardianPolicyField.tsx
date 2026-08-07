@@ -41,8 +41,7 @@ export function GuardianPolicyField({
         id="global-agent-guardian-policy-description"
       >
         Monitor allows permission requests and records each decision. Lockdown
-        denies permission requests before the tool runs. An inherited Lockdown
-        policy cannot be weakened for an individual agent.
+        denies permission requests before the tool runs.
       </p>
     </div>
   );

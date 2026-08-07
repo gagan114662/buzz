@@ -1,8 +1,9 @@
 use std::process::Command;
 
+use crate::managed_agents::access_policy::{
+    build_respond_to_env_with_policy, owner_only, RespondToEnv,
+};
 use crate::managed_agents::{resolve_command, KnownAcpRuntime, ManagedAgentRecord};
-
-type RespondToEnv = (Vec<(&'static str, String)>, Vec<&'static str>);
 
 /// Pure decision function for the inbound author gate env vars.
 ///
@@ -21,46 +22,7 @@ pub(crate) fn build_respond_to_env(
     record: &ManagedAgentRecord,
     owner_hex: Option<&str>,
 ) -> Result<RespondToEnv, String> {
-    let normalized =
-        crate::managed_agents::types::validate_respond_to_allowlist(&record.respond_to_allowlist)?;
-    if record.respond_to == crate::managed_agents::types::RespondTo::Allowlist
-        && normalized.is_empty()
-    {
-        return Err(
-            "respond-to mode 'allowlist' requires at least one pubkey in the allowlist".to_string(),
-        );
-    }
-
-    let mut set: Vec<(&'static str, String)> = Vec::new();
-    let mut remove: Vec<&'static str> = Vec::new();
-
-    set.push((
-        "BUZZ_ACP_RESPOND_TO",
-        record.respond_to.as_str().to_string(),
-    ));
-
-    if record.respond_to == crate::managed_agents::types::RespondTo::Allowlist {
-        set.push(("BUZZ_ACP_RESPOND_TO_ALLOWLIST", normalized.join(",")));
-    } else {
-        remove.push("BUZZ_ACP_RESPOND_TO_ALLOWLIST");
-    }
-
-    // Legacy fallback: agents created before NIP-OA lack `auth_tag`. Without
-    // it the harness can't resolve the owner, and owner-dependent gate modes
-    // would drop every event. Forwarding the workspace owner pubkey via
-    // BUZZ_ACP_AGENT_OWNER keeps those records functional. Modern records
-    // (`auth_tag = Some(...)`) use `BUZZ_AUTH_TAG` as before.
-    if record.auth_tag.is_none() {
-        if let Some(owner) = owner_hex {
-            set.push(("BUZZ_ACP_AGENT_OWNER", owner.to_string()));
-        } else {
-            remove.push("BUZZ_ACP_AGENT_OWNER");
-        }
-    } else {
-        remove.push("BUZZ_ACP_AGENT_OWNER");
-    }
-
-    Ok((set, remove))
+    build_respond_to_env_with_policy(record, owner_hex, owner_only())
 }
 
 pub(crate) fn configure_runtime_cli(command: &mut Command, runtime: Option<&KnownAcpRuntime>) {

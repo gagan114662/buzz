@@ -1,16 +1,41 @@
+import * as React from "react";
 import { ShieldAlert } from "lucide-react";
+import { toast } from "sonner";
 
-import type { NumbatFinding } from "@/shared/api/tauriNumbat";
+import {
+  acknowledgeGuardianFinding,
+  cancelGuardianSuppression,
+  createGuardianCase,
+  createGuardianSuppression,
+  importGuardianCaseBundle,
+  listGuardianCases,
+  listGuardianSuppressions,
+  saveGuardianCaseBundle,
+  type GuardianCase,
+  type GuardianSuppression,
+  type NumbatFinding,
+  updateGuardianCaseStatus,
+} from "@/shared/api/tauriNumbat";
+import {
+  createGuardianPolicyDraft,
+  listGuardianPolicyVersions,
+  simulateGuardianPolicy,
+  transitionGuardianPolicy,
+  type GuardianPolicyVersion,
+} from "@/shared/api/tauriGuardianPolicies";
 import { Badge } from "@/shared/ui/badge";
 import { Button } from "@/shared/ui/button";
+import { Input } from "@/shared/ui/input";
 import { cn } from "@/shared/lib/cn";
 
 export function NumbatSecurityFindings({
+  agentPubkey,
   error,
   findings,
   health,
   onCancelTurn,
 }: {
+  agentPubkey: string;
   error: string | null;
   findings: NumbatFinding[];
   health: {
@@ -19,6 +44,44 @@ export function NumbatSecurityFindings({
   } | null;
   onCancelTurn?: () => void;
 }) {
+  const [acknowledged, setAcknowledged] = React.useState<Set<string>>(
+    () => new Set(),
+  );
+  const [cases, setCases] = React.useState<GuardianCase[]>([]);
+  const [caseSelection, setCaseSelection] = React.useState<Set<string>>(
+    () => new Set(),
+  );
+  const [pendingFinding, setPendingFinding] = React.useState<string | null>(
+    null,
+  );
+  const [suppressions, setSuppressions] = React.useState<GuardianSuppression[]>(
+    [],
+  );
+  const [suppressionDraft, setSuppressionDraft] = React.useState<string | null>(
+    null,
+  );
+  const [suppressionReason, setSuppressionReason] = React.useState("");
+  const [fullExportCase, setFullExportCase] = React.useState<string | null>(
+    null,
+  );
+  const [fullExportDestination, setFullExportDestination] = React.useState("");
+  const [fullExportConfirmed, setFullExportConfirmed] = React.useState(false);
+  const bundleImportRef = React.useRef<HTMLInputElement>(null);
+
+  const refreshCases = React.useCallback(() => {
+    void listGuardianCases(agentPubkey)
+      .then(setCases)
+      .catch(() => undefined);
+  }, [agentPubkey]);
+
+  React.useEffect(refreshCases, [refreshCases]);
+
+  React.useEffect(() => {
+    void listGuardianSuppressions(agentPubkey)
+      .then(setSuppressions)
+      .catch(() => undefined);
+  }, [agentPubkey]);
+
   if (findings.length === 0 && !error && !health) return null;
 
   return (
@@ -33,10 +96,304 @@ export function NumbatSecurityFindings({
           <span>{health.detail}</span>
         </div>
       ) : null}
+      <GuardianPolicyWorkspace agentPubkey={agentPubkey} />
+      <div className="flex items-center gap-2">
+        <Button
+          data-testid="guardian-import-case-bundle"
+          onClick={() => bundleImportRef.current?.click()}
+          size="xs"
+          type="button"
+          variant="outline"
+        >
+          Verify imported case bundle
+        </Button>
+        <input
+          accept=".zip,application/zip"
+          className="hidden"
+          data-testid="guardian-import-case-input"
+          onChange={(event) => {
+            const file = event.target.files?.[0];
+            if (!file) return;
+            void file
+              .arrayBuffer()
+              .then((buffer) =>
+                importGuardianCaseBundle(Array.from(new Uint8Array(buffer))),
+              )
+              .then((preview) => {
+                if (preview.verified) {
+                  toast.success(
+                    `Verified ${preview.profile} bundle for case ${preview.caseId}`,
+                  );
+                }
+              })
+              .catch((cause: unknown) =>
+                toast.error(
+                  cause instanceof Error
+                    ? cause.message
+                    : "Could not verify case bundle",
+                ),
+              );
+            event.target.value = "";
+          }}
+          ref={bundleImportRef}
+          type="file"
+        />
+      </div>
+      {cases.length > 0 ? (
+        <div className="space-y-2" data-testid="guardian-case-list">
+          <p
+            className="text-xs text-muted-foreground"
+            data-testid="guardian-case-count"
+          >
+            {cases.length} local investigation case
+            {cases.length === 1 ? "" : "s"}
+          </p>
+          {cases.map((item) => {
+            const nextStatus =
+              item.status === "new"
+                ? "triaged"
+                : item.status === "triaged" || item.status === "reopened"
+                  ? "investigating"
+                  : item.status === "investigating"
+                    ? "resolved"
+                    : item.status === "resolved"
+                      ? "closed"
+                      : item.status === "closed"
+                        ? "reopened"
+                        : null;
+            return (
+              <div
+                className="flex flex-wrap items-center justify-between gap-2 rounded-md border border-border/70 px-3 py-2"
+                data-case-id={item.caseId}
+                key={item.caseId}
+              >
+                <div className="min-w-0">
+                  <p className="truncate text-xs font-medium">{item.title}</p>
+                  <p className="text-xs text-muted-foreground">
+                    {item.status.replaceAll("_", " ")} ·{" "}
+                    {item.findingIds.length} finding
+                    {item.findingIds.length === 1 ? "" : "s"}
+                  </p>
+                </div>
+                {nextStatus ? (
+                  <Button
+                    data-testid="guardian-advance-case"
+                    onClick={() => {
+                      void updateGuardianCaseStatus(item.caseId, nextStatus)
+                        .then((updated) => {
+                          setCases((current) =>
+                            current.map((candidate) =>
+                              candidate.caseId === updated.caseId
+                                ? updated
+                                : candidate,
+                            ),
+                          );
+                          toast.success(
+                            `Case moved to ${updated.status.replaceAll("_", " ")}`,
+                          );
+                        })
+                        .catch((cause: unknown) =>
+                          toast.error(
+                            cause instanceof Error
+                              ? cause.message
+                              : "Could not update case",
+                          ),
+                        );
+                    }}
+                    size="xs"
+                    type="button"
+                    variant="outline"
+                  >
+                    {nextStatus === "reopened"
+                      ? "Reopen"
+                      : `Mark ${nextStatus.replaceAll("_", " ")}`}
+                  </Button>
+                ) : null}
+                <Button
+                  data-testid="guardian-export-redacted-case"
+                  onClick={() => {
+                    void saveGuardianCaseBundle(item.caseId, "redacted")
+                      .then((saved) => {
+                        if (saved) toast.success("Redacted case bundle saved");
+                      })
+                      .catch((cause: unknown) =>
+                        toast.error(
+                          cause instanceof Error
+                            ? cause.message
+                            : "Could not export case",
+                        ),
+                      );
+                  }}
+                  size="xs"
+                  type="button"
+                  variant="outline"
+                >
+                  Export redacted
+                </Button>
+                <Button
+                  data-testid="guardian-export-regression-case"
+                  onClick={() => {
+                    void saveGuardianCaseBundle(item.caseId, "regression")
+                      .then((saved) => {
+                        if (saved) toast.success("Regression fixture saved");
+                      })
+                      .catch((cause: unknown) =>
+                        toast.error(
+                          cause instanceof Error
+                            ? cause.message
+                            : "Could not export fixture",
+                        ),
+                      );
+                  }}
+                  size="xs"
+                  type="button"
+                  variant="outline"
+                >
+                  Export fixture
+                </Button>
+                <Button
+                  data-testid="guardian-export-full-case"
+                  onClick={() => {
+                    setFullExportCase(item.caseId);
+                    setFullExportDestination("");
+                    setFullExportConfirmed(false);
+                  }}
+                  size="xs"
+                  type="button"
+                  variant="outline"
+                >
+                  Export full forensic
+                </Button>
+                {fullExportCase === item.caseId ? (
+                  <div
+                    className="w-full space-y-2 rounded-md border border-destructive/40 bg-destructive/5 p-2"
+                    data-testid="guardian-full-export-confirmation"
+                  >
+                    <p className="text-xs text-destructive">
+                      Full forensic evidence can contain secrets, exact
+                      timestamps, and sensitive local runtime details. Name the
+                      intended destination and confirm before the save dialog
+                      opens.
+                    </p>
+                    <Input
+                      aria-label="Full forensic export destination"
+                      maxLength={160}
+                      onChange={(event) =>
+                        setFullExportDestination(event.target.value)
+                      }
+                      placeholder="Destination, recipient, or support case"
+                      value={fullExportDestination}
+                    />
+                    <label className="flex items-start gap-2 text-xs">
+                      <input
+                        checked={fullExportConfirmed}
+                        onChange={(event) =>
+                          setFullExportConfirmed(event.target.checked)
+                        }
+                        type="checkbox"
+                      />
+                      I understand this bundle may contain secrets and authorize
+                      export to the named destination.
+                    </label>
+                    <div className="flex gap-2">
+                      <Button
+                        data-testid="guardian-confirm-full-export"
+                        disabled={
+                          !fullExportConfirmed ||
+                          fullExportDestination.trim().length < 3
+                        }
+                        onClick={() => {
+                          void saveGuardianCaseBundle(item.caseId, "full", {
+                            destinationLabel: fullExportDestination.trim(),
+                            ownerConfirmedSecrets: true,
+                          })
+                            .then((saved) => {
+                              if (saved) {
+                                toast.success("Full forensic bundle saved");
+                                setFullExportCase(null);
+                              }
+                            })
+                            .catch((cause: unknown) =>
+                              toast.error(
+                                cause instanceof Error
+                                  ? cause.message
+                                  : "Could not export forensic evidence",
+                              ),
+                            );
+                        }}
+                        size="xs"
+                        type="button"
+                        variant="destructive"
+                      >
+                        Confirm and choose file
+                      </Button>
+                      <Button
+                        onClick={() => setFullExportCase(null)}
+                        size="xs"
+                        type="button"
+                        variant="ghost"
+                      >
+                        Cancel
+                      </Button>
+                    </div>
+                  </div>
+                ) : null}
+              </div>
+            );
+          })}
+        </div>
+      ) : null}
+      {findings.filter(
+        (finding) =>
+          !cases.some((item) => item.findingIds.includes(finding.findingId)),
+      ).length > 1 ? (
+        <div className="flex flex-wrap items-center gap-2 rounded-md border border-border/70 px-3 py-2">
+          <span className="text-xs text-muted-foreground">
+            {caseSelection.size} findings selected for one investigation
+          </span>
+          <Button
+            data-testid="guardian-create-grouped-case"
+            disabled={
+              caseSelection.size < 2 || pendingFinding === "grouped-case"
+            }
+            onClick={() => {
+              const findingIds = [...caseSelection];
+              setPendingFinding("grouped-case");
+              void createGuardianCase(
+                agentPubkey,
+                findingIds,
+                `Investigation: ${findingIds.length} correlated findings`,
+              )
+                .then((created) => {
+                  setCases((current) => [created, ...current]);
+                  setCaseSelection(new Set());
+                  toast.success("Grouped investigation case opened");
+                })
+                .catch((cause: unknown) =>
+                  toast.error(
+                    cause instanceof Error
+                      ? cause.message
+                      : "Could not open grouped case",
+                  ),
+                )
+                .finally(() => setPendingFinding(null));
+            }}
+            size="xs"
+            type="button"
+            variant="outline"
+          >
+            Open grouped case
+          </Button>
+        </div>
+      ) : null}
       {findings
         .slice()
         .reverse()
         .map((finding) => {
+          const activeSuppression = suppressions.find(
+            (item) =>
+              item.findingId === finding.findingId && item.status === "active",
+          );
           return (
             <article
               className={cn(
@@ -46,6 +403,7 @@ export function NumbatSecurityFindings({
                   : finding.severity === "high"
                     ? "border-amber-500/40 bg-amber-500/10"
                     : "border-border/70 bg-muted/35",
+                activeSuppression && "opacity-70",
               )}
               data-finding-id={finding.findingId}
               key={finding.findingId}
@@ -63,6 +421,9 @@ export function NumbatSecurityFindings({
                     <span className="text-sm font-semibold">
                       {finding.title}
                     </span>
+                    {activeSuppression ? (
+                      <Badge variant="outline">Suppressed</Badge>
+                    ) : null}
                   </div>
                   <p className="mt-1 text-xs text-muted-foreground">
                     {finding.evidenceCount} correlated evidence event
@@ -74,6 +435,262 @@ export function NumbatSecurityFindings({
                   <p className="mt-1 font-mono text-xs text-muted-foreground">
                     {finding.ruleId}
                   </p>
+                  <div className="mt-2 flex flex-wrap gap-2">
+                    {!cases.some((item) =>
+                      item.findingIds.includes(finding.findingId),
+                    ) ? (
+                      <label className="flex items-center gap-1.5 text-xs text-muted-foreground">
+                        <input
+                          checked={caseSelection.has(finding.findingId)}
+                          data-testid="guardian-select-case-finding"
+                          onChange={(event) => {
+                            setCaseSelection((current) => {
+                              const next = new Set(current);
+                              if (event.target.checked) {
+                                next.add(finding.findingId);
+                              } else {
+                                next.delete(finding.findingId);
+                              }
+                              return next;
+                            });
+                          }}
+                          type="checkbox"
+                        />
+                        Add to grouped case
+                      </label>
+                    ) : null}
+                    <Button
+                      data-testid="guardian-acknowledge-finding"
+                      disabled={
+                        pendingFinding === finding.findingId ||
+                        acknowledged.has(finding.findingId)
+                      }
+                      onClick={() => {
+                        setPendingFinding(finding.findingId);
+                        void acknowledgeGuardianFinding(
+                          agentPubkey,
+                          finding.findingId,
+                        )
+                          .then(() => {
+                            setAcknowledged((current) =>
+                              new Set(current).add(finding.findingId),
+                            );
+                            toast.success("Finding acknowledged");
+                          })
+                          .catch((cause: unknown) =>
+                            toast.error(
+                              cause instanceof Error
+                                ? cause.message
+                                : "Could not acknowledge finding",
+                            ),
+                          )
+                          .finally(() => setPendingFinding(null));
+                      }}
+                      size="xs"
+                      type="button"
+                      variant="outline"
+                    >
+                      {acknowledged.has(finding.findingId)
+                        ? "Acknowledged"
+                        : "Acknowledge"}
+                    </Button>
+                    {activeSuppression ? (
+                      <>
+                        <Button
+                          data-testid="guardian-renew-suppression"
+                          disabled={pendingFinding === finding.findingId}
+                          onClick={() => {
+                            setPendingFinding(finding.findingId);
+                            void createGuardianSuppression(
+                              agentPubkey,
+                              finding.findingId,
+                              activeSuppression.reason,
+                              new Date(
+                                Date.now() + 24 * 60 * 60 * 1000,
+                              ).toISOString(),
+                              activeSuppression.suppressionId,
+                            )
+                              .then((renewed) => {
+                                setSuppressions((current) => [
+                                  renewed,
+                                  ...current.map((item) =>
+                                    item.suppressionId ===
+                                    activeSuppression.suppressionId
+                                      ? {
+                                          ...item,
+                                          status: "superseded" as const,
+                                        }
+                                      : item,
+                                  ),
+                                ]);
+                                toast.success(
+                                  "Suppression renewed for 24 hours",
+                                );
+                              })
+                              .catch((cause: unknown) =>
+                                toast.error(
+                                  cause instanceof Error
+                                    ? cause.message
+                                    : "Could not renew suppression",
+                                ),
+                              )
+                              .finally(() => setPendingFinding(null));
+                          }}
+                          size="xs"
+                          type="button"
+                          variant="outline"
+                        >
+                          Renew 24h
+                        </Button>
+                        <Button
+                          data-testid="guardian-cancel-suppression"
+                          disabled={pendingFinding === finding.findingId}
+                          onClick={() => {
+                            setPendingFinding(finding.findingId);
+                            void cancelGuardianSuppression(
+                              activeSuppression.suppressionId,
+                              "Owner restored alert notifications",
+                            )
+                              .then((cancelled) => {
+                                setSuppressions((current) =>
+                                  current.map((item) =>
+                                    item.suppressionId ===
+                                    cancelled.suppressionId
+                                      ? cancelled
+                                      : item,
+                                  ),
+                                );
+                                toast.success("Alert suppression cancelled");
+                              })
+                              .catch((cause: unknown) =>
+                                toast.error(
+                                  cause instanceof Error
+                                    ? cause.message
+                                    : "Could not cancel suppression",
+                                ),
+                              )
+                              .finally(() => setPendingFinding(null));
+                          }}
+                          size="xs"
+                          type="button"
+                          variant="outline"
+                        >
+                          Restore alerts
+                        </Button>
+                      </>
+                    ) : null}
+                    <Button
+                      data-testid="guardian-create-case"
+                      disabled={
+                        pendingFinding === finding.findingId ||
+                        cases.some((item) =>
+                          item.findingIds.includes(finding.findingId),
+                        )
+                      }
+                      onClick={() => {
+                        setPendingFinding(finding.findingId);
+                        void createGuardianCase(
+                          agentPubkey,
+                          [finding.findingId],
+                          finding.title,
+                        )
+                          .then((created) => {
+                            setCases((current) => [created, ...current]);
+                            toast.success("Investigation case opened");
+                          })
+                          .catch((cause: unknown) =>
+                            toast.error(
+                              cause instanceof Error
+                                ? cause.message
+                                : "Could not open case",
+                            ),
+                          )
+                          .finally(() => setPendingFinding(null));
+                      }}
+                      size="xs"
+                      type="button"
+                      variant="outline"
+                    >
+                      {cases.some((item) =>
+                        item.findingIds.includes(finding.findingId),
+                      )
+                        ? "Case opened"
+                        : "Open case"}
+                    </Button>
+                    <Button
+                      data-testid="guardian-suppress-finding"
+                      disabled={Boolean(activeSuppression)}
+                      onClick={() => {
+                        setSuppressionDraft(finding.findingId);
+                        setSuppressionReason("");
+                      }}
+                      size="xs"
+                      type="button"
+                      variant="outline"
+                    >
+                      {activeSuppression ? "Suppressed" : "Suppress"}
+                    </Button>
+                  </div>
+                  {suppressionDraft === finding.findingId ? (
+                    <div
+                      className="mt-2 flex items-center gap-2"
+                      data-testid="guardian-suppression-form"
+                    >
+                      <Input
+                        aria-label="Suppression reason"
+                        maxLength={240}
+                        onChange={(event) =>
+                          setSuppressionReason(event.target.value)
+                        }
+                        placeholder="Reason for suppressing this alert"
+                        value={suppressionReason}
+                      />
+                      <Button
+                        disabled={suppressionReason.trim().length < 3}
+                        onClick={() => {
+                          setPendingFinding(finding.findingId);
+                          const expiresAt = new Date(
+                            Date.now() + 24 * 60 * 60 * 1000,
+                          ).toISOString();
+                          void createGuardianSuppression(
+                            agentPubkey,
+                            finding.findingId,
+                            suppressionReason.trim(),
+                            expiresAt,
+                          )
+                            .then((created) => {
+                              setSuppressions((current) => [
+                                created,
+                                ...current,
+                              ]);
+                              setSuppressionDraft(null);
+                              setSuppressionReason("");
+                              toast.success("Alert suppressed for 24 hours");
+                            })
+                            .catch((cause: unknown) =>
+                              toast.error(
+                                cause instanceof Error
+                                  ? cause.message
+                                  : "Could not suppress finding",
+                              ),
+                            )
+                            .finally(() => setPendingFinding(null));
+                        }}
+                        size="xs"
+                        type="button"
+                      >
+                        Suppress 24h
+                      </Button>
+                      <Button
+                        onClick={() => setSuppressionDraft(null)}
+                        size="xs"
+                        type="button"
+                        variant="ghost"
+                      >
+                        Cancel
+                      </Button>
+                    </div>
+                  ) : null}
                   {(finding.severity === "high" ||
                     finding.severity === "critical") &&
                   onCancelTurn ? (
@@ -99,5 +716,223 @@ export function NumbatSecurityFindings({
         </p>
       ) : null}
     </section>
+  );
+}
+
+const POLICY_OPERATIONS = [
+  "read",
+  "write",
+  "network",
+  "shell",
+  "browser",
+  "secrets",
+  "unknown-adapter",
+] as const;
+
+function GuardianPolicyWorkspace({ agentPubkey }: { agentPubkey: string }) {
+  const [policies, setPolicies] = React.useState<GuardianPolicyVersion[]>([]);
+  const [busy, setBusy] = React.useState<string | null>(null);
+
+  const refresh = React.useCallback(() => {
+    void listGuardianPolicyVersions(agentPubkey)
+      .then(setPolicies)
+      .catch(() => undefined);
+  }, [agentPubkey]);
+
+  React.useEffect(refresh, [refresh]);
+
+  const run = (
+    policyHash: string,
+    work: () => Promise<unknown>,
+    success: string,
+  ) => {
+    setBusy(policyHash);
+    void work()
+      .then(() => {
+        toast.success(success);
+        refresh();
+      })
+      .catch((cause: unknown) =>
+        toast.error(
+          cause instanceof Error ? cause.message : "Policy action failed",
+        ),
+      )
+      .finally(() => setBusy(null));
+  };
+
+  return (
+    <details
+      className="rounded-lg border border-border/70 bg-muted/20 px-3 py-2"
+      data-testid="guardian-policy-workspace"
+    >
+      <summary className="cursor-pointer text-xs font-semibold">
+        Versioned policy workspace
+      </summary>
+      <p className="mt-2 text-xs text-muted-foreground">
+        Drafts are immutable. Deny policies must pass every local simulation
+        partition before approval. Rollout is limited to this local agent until
+        organization trust is configured.
+      </p>
+      <div className="mt-2 flex flex-wrap gap-2">
+        <Button
+          data-testid="guardian-create-monitor-policy"
+          onClick={() =>
+            run(
+              "new-monitor",
+              () =>
+                createGuardianPolicyDraft(
+                  agentPubkey,
+                  `Monitor ${new Date().toISOString().slice(0, 10)}`,
+                  "monitor",
+                  POLICY_OPERATIONS.map((operation) => ({
+                    operation,
+                    decision: "allow" as const,
+                  })),
+                ),
+              "Monitor policy draft created",
+            )
+          }
+          size="xs"
+          type="button"
+          variant="outline"
+        >
+          New monitor draft
+        </Button>
+        <Button
+          data-testid="guardian-create-deny-policy"
+          onClick={() =>
+            run(
+              "new-deny",
+              () =>
+                createGuardianPolicyDraft(
+                  agentPubkey,
+                  `Lockdown ${new Date().toISOString().slice(0, 10)}`,
+                  "deny",
+                  POLICY_OPERATIONS.map((operation) => ({
+                    operation,
+                    decision:
+                      operation === "read" ? ("allow" as const) : "deny",
+                  })),
+                ),
+              "Lockdown policy draft created",
+            )
+          }
+          size="xs"
+          type="button"
+          variant="outline"
+        >
+          New lockdown draft
+        </Button>
+      </div>
+      <div className="mt-2 space-y-2">
+        {policies.map((policy) => {
+          const rollbackTarget = policies.find(
+            (candidate) =>
+              candidate.policyHash !== policy.policyHash &&
+              candidate.simulationHash !== null &&
+              ["approved", "paused", "rolled_back", "active"].includes(
+                candidate.state,
+              ),
+          );
+          const action =
+            policy.state === "draft"
+              ? "simulate"
+              : policy.state === "simulated"
+                ? "request_approval"
+                : policy.state === "awaiting_approval"
+                  ? "approve"
+                  : policy.state === "approved"
+                    ? "stage_local_canary"
+                    : policy.state === "staged" || policy.state === "paused"
+                      ? "activate"
+                      : policy.state === "active"
+                        ? "pause"
+                        : null;
+          return (
+            <div
+              className="flex flex-wrap items-center justify-between gap-2 rounded-md border border-border/60 px-2 py-2"
+              data-policy-hash={policy.policyHash}
+              key={policy.policyHash}
+            >
+              <div className="min-w-0">
+                <p className="truncate text-xs font-medium">{policy.name}</p>
+                <p className="text-xs text-muted-foreground">
+                  {policy.mode} · {policy.state.replaceAll("_", " ")} ·{" "}
+                  {policy.policyHash.slice(0, 10)}
+                </p>
+              </div>
+              <div className="flex gap-1">
+                {action ? (
+                  <Button
+                    data-testid="guardian-policy-next-action"
+                    disabled={busy !== null}
+                    onClick={() => {
+                      if (action === "simulate") {
+                        run(
+                          policy.policyHash,
+                          () => simulateGuardianPolicy(policy.policyHash),
+                          "Policy simulation complete",
+                        );
+                        return;
+                      }
+                      const approval =
+                        action === "approve"
+                          ? {
+                              targetAgentPubkey: agentPubkey,
+                              expiresAt: new Date(
+                                Date.now() + 7 * 24 * 60 * 60 * 1000,
+                              ).toISOString(),
+                            }
+                          : undefined;
+                      run(
+                        policy.policyHash,
+                        () =>
+                          transitionGuardianPolicy(
+                            policy.policyHash,
+                            action,
+                            approval,
+                          ),
+                        `Policy moved to ${action.replaceAll("_", " ")}`,
+                      );
+                    }}
+                    size="xs"
+                    type="button"
+                    variant="outline"
+                  >
+                    {action.replaceAll("_", " ")}
+                  </Button>
+                ) : null}
+                {policy.state === "active" ||
+                policy.state === "paused" ||
+                policy.state === "staged" ? (
+                  <Button
+                    data-testid="guardian-policy-rollback"
+                    disabled={busy !== null || !rollbackTarget}
+                    onClick={() =>
+                      run(
+                        policy.policyHash,
+                        () =>
+                          transitionGuardianPolicy(
+                            policy.policyHash,
+                            "rollback",
+                            undefined,
+                            rollbackTarget?.policyHash,
+                          ),
+                        "Policy rolled back",
+                      )
+                    }
+                    size="xs"
+                    type="button"
+                    variant="destructive"
+                  >
+                    {rollbackTarget ? "Roll back" : "No verified rollback"}
+                  </Button>
+                ) : null}
+              </div>
+            </div>
+          );
+        })}
+      </div>
+    </details>
   );
 }

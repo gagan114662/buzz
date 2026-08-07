@@ -19,6 +19,7 @@
 
 pub(crate) mod causal_ledger;
 mod pipeline;
+pub mod shepherd;
 pub mod store;
 
 use pipeline::{commit_archive, plan_archive, query_buckets};

@@ -32,6 +32,7 @@ import {
   personaBehaviorDraftValid,
 } from "./personaBehaviorDraft";
 import {
+  ADVANCED_FIELDS_MOTION_TRANSITION,
   AUTO_MODEL_DROPDOWN_VALUE,
   AUTO_PROVIDER_DROPDOWN_VALUE,
   BLOCK_BUILD_HIDDEN_PROVIDER_IDS,
@@ -42,6 +43,7 @@ import {
   getDefaultPersonaRuntime,
   getPersonaModelOptions,
   getPersonaProviderOptions,
+  getProviderApiKeyLabel,
   getRuntimePersonaModelOptions,
   NO_RUNTIME_DROPDOWN_VALUE,
   runtimeSupportsLlmProviderSelection,
@@ -99,7 +101,7 @@ type AgentDefinitionDialogProps = {
   error: Error | null;
   isPending: boolean;
   runtimes: AcpRuntimeCatalogEntry[];
-  runtimesLoading?: boolean;
+  runtimeCatalogStatus?: "loading" | "ready" | "error";
   onOpenChange: (open: boolean) => void;
   onSubmit: (
     input: CreatePersonaInput | UpdatePersonaInput,
@@ -117,11 +119,6 @@ export type AgentDefinitionSubmitOptions = {
   publishCatalogUpdates: boolean;
 };
 
-const ADVANCED_FIELDS_MOTION_TRANSITION = {
-  duration: 0.18,
-  ease: [0.23, 1, 0.32, 1],
-} as const;
-
 export function AgentDefinitionDialog({
   open,
   title,
@@ -131,13 +128,14 @@ export function AgentDefinitionDialog({
   error,
   isPending,
   runtimes,
-  runtimesLoading = false,
+  runtimeCatalogStatus = "ready" as const,
   onOpenChange,
   onSubmit,
   publishCatalogUpdatesOnSave = false,
   createRunSection,
   createSubmitBlocked = false,
 }: AgentDefinitionDialogProps) {
+  const runtimesLoading = runtimeCatalogStatus === "loading";
   const [displayName, setDisplayName] = React.useState("");
   const [aiDefaultsOpen, setAiDefaultsOpen] = React.useState(false);
   const aiDefaultsTriggerRef = React.useRef<HTMLButtonElement>(null);
@@ -156,8 +154,18 @@ export function AgentDefinitionDialog({
   const [behaviorDraft, setBehaviorDraft] = React.useState(
     emptyPersonaBehaviorDraft,
   );
+  // The seed the draft is diffed against at submit: an untouched quad
+  // submits no behavior group, keeping unrelated edits hash-quiet.
   const behaviorSeedRef = React.useRef(emptyPersonaBehaviorDraft);
+  // Tracks when the runtime was auto-seeded by the default-runtime effect in
+  // edit mode (i.e. the user never explicitly chose a runtime). Used to omit
+  // the seeded runtime from the submit payload for builtin definitions whose
+  // canonical runtime is null — the sync would revert it anyway.
   const isRuntimeAutoSeededRef = React.useRef(false);
+  // Guards the seeding effect so it fires at most once per dialog-open.
+  // Without this, clearing runtime back to "" via "No preference" would re-
+  // trigger the effect (the `runtime` dep would pass the length guard) and
+  // snap the dropdown back to the default — an edit-mode regression.
   const hasSeededForOpenRef = React.useRef(false);
   const [showAdvancedFields, setShowAdvancedFields] = React.useState(false);
   const [isAvatarUploadPending, setIsAvatarUploadPending] =
@@ -239,6 +247,10 @@ export function AgentDefinitionDialog({
     setRuntime(defaultRuntime.id);
     hasSeededForOpenRef.current = true;
     if ("id" in initialValues) {
+      // Edit mode: record that this runtime was auto-seeded so the submit path
+      // can omit it from the payload for builtin definitions (canonical runtime
+      // null; sync would revert the value anyway). Explicit user changes via
+      // the dropdown clear this flag.
       isRuntimeAutoSeededRef.current = true;
     }
   }, [defaultRuntime, initialValues, open, runtime, runtimesLoading]);
@@ -302,12 +314,16 @@ export function AgentDefinitionDialog({
       setIsAvatarUploadPending(false);
       setHasUserChanges(false);
       setIsAddHarnessOpen(false);
+      // isRuntimeAutoSeededRef and hasSeededForOpenRef are NOT reset here — the
+      // [initialValues, open] effect resets both when the dialog re-opens.
     }
 
     onOpenChange(next);
   }
 
   async function handleSubmit() {
+    // D1: the same localModeSatisfied gate as canSubmit prevents form-submit
+    // (Enter) from bypassing a missing credential.
     if (!initialValues || !localModeSatisfied || !canSubmit) return;
 
     const {
@@ -379,6 +395,7 @@ export function AgentDefinitionDialog({
     (runtime.trim().length > 0 && runtimeCanChooseLlmProvider) ||
     blankRuntimeModelProviderEditable;
   const trimmedProvider = provider.trim();
+  // Required credential env keys and file-layer config; silences requirements satisfied in the file layer.
   const { data: runtimeFileConfig } = useRuntimeFileConfigQuery(runtime, {
     enabled: open,
   });
@@ -428,8 +445,13 @@ export function AgentDefinitionDialog({
       runtimeFileConfig,
     ],
   );
+  // requiredEnvKeys: the gate already handles baked-, global-, and file-
+  // satisfied keys so no further filtering is needed.
   const { requiredEnvKeys } = localModeGate;
   const localModeSatisfied = localModeGate.satisfied;
+  // Effective provider: agent value → global fallback → file fallback.
+  // Mirrors the chain inside computeLocalModeGate so model-option scoping and
+  // model requiredness are consistent with the readiness gate.
   const fileProvider = runtimeFileConfig?.provider?.trim() ?? "";
   const effectiveProvider =
     trimmedProvider || inheritedProviderDefault.value || fileProvider;
@@ -879,14 +901,11 @@ export function AgentDefinitionDialog({
               topLevelSecretEnvVar ? (
                 <PersonaProviderApiKeyField
                   disabled={isPending}
+                  envVarName={topLevelSecretEnvVar}
                   isInherited={apiKeyIsInherited}
                   inheritedLabel={apiKeyInheritedLabel}
                   isRequired={apiKeyIsRequired}
-                  label={
-                    effectiveProvider === "anthropic"
-                      ? "Anthropic API key"
-                      : "OpenAI API key"
-                  }
+                  label={getProviderApiKeyLabel(effectiveProvider) ?? "API key"}
                   onValueChange={(next) => {
                     setEnvVars((prev) => ({
                       ...prev,
@@ -994,6 +1013,8 @@ export function AgentDefinitionDialog({
                       model={model}
                       modelTuningRuntimeId={runtime}
                       namePoolText={namePoolText}
+                      catalogStatus={runtimeCatalogStatus}
+                      selectedRuntime={selectedRuntime}
                       onBehaviorDraftChange={(nextBehaviorDraft) => {
                         setHasUserChanges(true);
                         setBehaviorDraft(nextBehaviorDraft);
