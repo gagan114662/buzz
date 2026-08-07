@@ -101,4 +101,12 @@ test("renders three privacy-projected Guardian alerts", async ({ page }) => {
   await expect(guardian.getByTestId("guardian-case-count")).toContainText(
     "1 local investigation case",
   );
+
+  await highFinding.getByTestId("guardian-suppress-finding").click();
+  const suppressionForm = highFinding.getByTestId("guardian-suppression-form");
+  await suppressionForm
+    .getByLabel("Suppression reason")
+    .fill("Known local test activity");
+  await suppressionForm.getByRole("button", { name: "Suppress 24h" }).click();
+  await expect(highFinding).toContainText("Suppressed");
 });

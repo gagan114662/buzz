@@ -5,12 +5,16 @@ import { toast } from "sonner";
 import {
   acknowledgeGuardianFinding,
   createGuardianCase,
+  createGuardianSuppression,
   listGuardianCases,
+  listGuardianSuppressions,
   type GuardianCase,
+  type GuardianSuppression,
   type NumbatFinding,
 } from "@/shared/api/tauriNumbat";
 import { Badge } from "@/shared/ui/badge";
 import { Button } from "@/shared/ui/button";
+import { Input } from "@/shared/ui/input";
 import { cn } from "@/shared/lib/cn";
 
 export function NumbatSecurityFindings({
@@ -36,6 +40,13 @@ export function NumbatSecurityFindings({
   const [pendingFinding, setPendingFinding] = React.useState<string | null>(
     null,
   );
+  const [suppressions, setSuppressions] = React.useState<GuardianSuppression[]>(
+    [],
+  );
+  const [suppressionDraft, setSuppressionDraft] = React.useState<string | null>(
+    null,
+  );
+  const [suppressionReason, setSuppressionReason] = React.useState("");
 
   const refreshCases = React.useCallback(() => {
     void listGuardianCases(agentPubkey)
@@ -44,6 +55,12 @@ export function NumbatSecurityFindings({
   }, [agentPubkey]);
 
   React.useEffect(refreshCases, [refreshCases]);
+
+  React.useEffect(() => {
+    void listGuardianSuppressions(agentPubkey)
+      .then(setSuppressions)
+      .catch(() => undefined);
+  }, [agentPubkey]);
 
   if (findings.length === 0 && !error && !health) return null;
 
@@ -71,6 +88,10 @@ export function NumbatSecurityFindings({
         .slice()
         .reverse()
         .map((finding) => {
+          const activeSuppression = suppressions.find(
+            (item) =>
+              item.findingId === finding.findingId && item.status === "active",
+          );
           return (
             <article
               className={cn(
@@ -80,6 +101,7 @@ export function NumbatSecurityFindings({
                   : finding.severity === "high"
                     ? "border-amber-500/40 bg-amber-500/10"
                     : "border-border/70 bg-muted/35",
+                activeSuppression && "opacity-70",
               )}
               data-finding-id={finding.findingId}
               key={finding.findingId}
@@ -97,6 +119,9 @@ export function NumbatSecurityFindings({
                     <span className="text-sm font-semibold">
                       {finding.title}
                     </span>
+                    {activeSuppression ? (
+                      <Badge variant="outline">Suppressed</Badge>
+                    ) : null}
                   </div>
                   <p className="mt-1 text-xs text-muted-foreground">
                     {finding.evidenceCount} correlated evidence event
@@ -182,7 +207,80 @@ export function NumbatSecurityFindings({
                         ? "Case opened"
                         : "Open case"}
                     </Button>
+                    <Button
+                      data-testid="guardian-suppress-finding"
+                      disabled={Boolean(activeSuppression)}
+                      onClick={() => {
+                        setSuppressionDraft(finding.findingId);
+                        setSuppressionReason("");
+                      }}
+                      size="xs"
+                      type="button"
+                      variant="outline"
+                    >
+                      {activeSuppression ? "Suppressed" : "Suppress"}
+                    </Button>
                   </div>
+                  {suppressionDraft === finding.findingId ? (
+                    <div
+                      className="mt-2 flex items-center gap-2"
+                      data-testid="guardian-suppression-form"
+                    >
+                      <Input
+                        aria-label="Suppression reason"
+                        maxLength={240}
+                        onChange={(event) =>
+                          setSuppressionReason(event.target.value)
+                        }
+                        placeholder="Reason for suppressing this alert"
+                        value={suppressionReason}
+                      />
+                      <Button
+                        disabled={suppressionReason.trim().length < 3}
+                        onClick={() => {
+                          setPendingFinding(finding.findingId);
+                          const expiresAt = new Date(
+                            Date.now() + 24 * 60 * 60 * 1000,
+                          ).toISOString();
+                          void createGuardianSuppression(
+                            agentPubkey,
+                            finding.findingId,
+                            suppressionReason.trim(),
+                            expiresAt,
+                          )
+                            .then((created) => {
+                              setSuppressions((current) => [
+                                created,
+                                ...current,
+                              ]);
+                              setSuppressionDraft(null);
+                              setSuppressionReason("");
+                              toast.success("Alert suppressed for 24 hours");
+                            })
+                            .catch((cause: unknown) =>
+                              toast.error(
+                                cause instanceof Error
+                                  ? cause.message
+                                  : "Could not suppress finding",
+                              ),
+                            )
+                            .finally(() => setPendingFinding(null));
+                        }}
+                        size="xs"
+                        type="button"
+                      >
+                        Suppress 24h
+                      </Button>
+                      <Button
+                        onClick={() => setSuppressionDraft(null)}
+                        size="xs"
+                        type="button"
+                        variant="ghost"
+                      >
+                        Cancel
+                      </Button>
+                    </div>
+                  ) : null}
                   {(finding.severity === "high" ||
                     finding.severity === "critical") &&
                   onCancelTurn ? (

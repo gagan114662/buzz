@@ -24,12 +24,39 @@ pub struct GuardianCaseProjection {
     updated_at: String,
 }
 
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GuardianSuppressionProjection {
+    suppression_id: String,
+    finding_id: String,
+    reason: String,
+    starts_at: String,
+    expires_at: String,
+    status: String,
+}
+
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct CreateGuardianCaseInput {
     agent_pubkey: String,
     finding_ids: Vec<String>,
     title: String,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct UpdateGuardianCaseStatusInput {
+    case_id: String,
+    status: String,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CreateGuardianSuppressionInput {
+    agent_pubkey: String,
+    finding_id: String,
+    reason: String,
+    expires_at: String,
 }
 
 fn store_path(app: &AppHandle) -> Result<PathBuf, String> {
@@ -44,6 +71,16 @@ fn open_store(app: &AppHandle) -> Result<Connection, String> {
     }
     let connection = Connection::open(path)
         .map_err(|error| format!("failed to open Guardian case storage: {error}"))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let mut permissions = std::fs::metadata(store_path(app)?)
+            .map_err(|error| format!("failed to inspect Guardian case storage: {error}"))?
+            .permissions();
+        permissions.set_mode(0o600);
+        std::fs::set_permissions(store_path(app)?, permissions)
+            .map_err(|error| format!("failed to protect Guardian case storage: {error}"))?;
+    }
     initialize(&connection)?;
     Ok(connection)
 }
@@ -89,6 +126,19 @@ fn initialize(connection: &Connection) -> Result<(), String> {
                created_at TEXT NOT NULL,
                previous_action_hash TEXT,
                action_hash TEXT NOT NULL UNIQUE
+             );
+             CREATE TABLE IF NOT EXISTS guardian_suppression (
+               suppression_id TEXT PRIMARY KEY,
+               schema_version TEXT NOT NULL,
+               version INTEGER NOT NULL,
+               agent_pubkey TEXT NOT NULL,
+               finding_id TEXT NOT NULL,
+               reason TEXT NOT NULL,
+               created_by TEXT NOT NULL,
+               starts_at TEXT NOT NULL,
+               expires_at TEXT NOT NULL,
+               status TEXT NOT NULL,
+               previous_version_hash TEXT
              );",
         )
         .map_err(|error| format!("failed to initialize Guardian case storage: {error}"))
@@ -399,6 +449,249 @@ pub fn list_guardian_cases(
     .collect()
 }
 
+#[tauri::command]
+pub fn update_guardian_case_status(
+    app: AppHandle,
+    input: UpdateGuardianCaseStatusInput,
+) -> Result<GuardianCaseProjection, String> {
+    validate_identifier(&input.case_id, "case id")?;
+    let mut connection = open_store(&app)?;
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(|error| format!("failed to begin Guardian case update: {error}"))?;
+    let row: (String, i64, String, String, String, String, String, String) = transaction
+        .query_row(
+            "SELECT title, version, status, severity, agent_pubkey,
+                    finding_ids_json, opened_at, updated_at
+             FROM guardian_case WHERE case_id = ?1",
+            [&input.case_id],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                ))
+            },
+        )
+        .map_err(|_| "Guardian case does not exist".to_string())?;
+    let (title, version, current, severity, _agent, findings, opened_at, updated_at) = row;
+    if !valid_case_transition(&current, &input.status) {
+        return Err(format!(
+            "Guardian case cannot move from {current} to {}",
+            input.status
+        ));
+    }
+    let previous = serde_json::to_vec(&serde_json::json!({
+        "caseId": input.case_id,
+        "version": version,
+        "title": title,
+        "status": current,
+        "severity": severity,
+        "findingIds": serde_json::from_str::<serde_json::Value>(&findings).unwrap_or_default(),
+        "openedAt": opened_at,
+        "updatedAt": updated_at,
+    }))
+    .map_err(|error| format!("failed to encode Guardian case version: {error}"))?;
+    let previous_hash = hex::encode(Sha256::digest(previous));
+    let now = Utc::now().to_rfc3339();
+    let changed = transaction
+        .execute(
+            "UPDATE guardian_case SET version = ?1, status = ?2,
+                    previous_version_hash = ?3, updated_at = ?4
+             WHERE case_id = ?5 AND version = ?6",
+            params![
+                version + 1,
+                input.status,
+                previous_hash,
+                now,
+                input.case_id,
+                version,
+            ],
+        )
+        .map_err(|error| format!("failed to update Guardian case: {error}"))?;
+    if changed != 1 {
+        return Err("Guardian case changed while it was being updated".into());
+    }
+    let actor = owner_pubkey(&app)?;
+    append_action(
+        &transaction,
+        None,
+        Some(&input.case_id),
+        "case_status_changed",
+        &actor,
+        &format!(
+            "Owner changed case status from {current} to {}",
+            input.status
+        ),
+        &now,
+    )?;
+    transaction
+        .commit()
+        .map_err(|error| format!("failed to commit Guardian case update: {error}"))?;
+    Ok(GuardianCaseProjection {
+        case_id: input.case_id,
+        title,
+        status: input.status,
+        severity,
+        finding_ids: serde_json::from_str(&findings)
+            .map_err(|error| format!("stored Guardian case is corrupt: {error}"))?,
+        opened_at,
+        updated_at: now,
+    })
+}
+
+#[tauri::command]
+pub fn create_guardian_suppression(
+    app: AppHandle,
+    input: CreateGuardianSuppressionInput,
+) -> Result<GuardianSuppressionProjection, String> {
+    validate_identifier(&input.finding_id, "finding id")?;
+    let reason = input.reason.trim();
+    if reason.chars().count() < 3 || reason.chars().count() > 240 {
+        return Err("suppression reason must contain 3 to 240 characters".into());
+    }
+    let now = Utc::now();
+    let expiry = chrono::DateTime::parse_from_rfc3339(&input.expires_at)
+        .map_err(|_| "suppression expiry must be an RFC3339 timestamp".to_string())?
+        .with_timezone(&Utc);
+    if expiry <= now || expiry > now + chrono::Duration::days(30) {
+        return Err("suppression expiry must be within the next 30 days".into());
+    }
+    let mut connection = open_store(&app)?;
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(|error| format!("failed to begin Guardian suppression: {error}"))?;
+    let finding_exists = transaction
+        .query_row(
+            "SELECT 1 FROM guardian_finding WHERE finding_id = ?1 AND agent_pubkey = ?2",
+            params![input.finding_id, input.agent_pubkey],
+            |_| Ok(()),
+        )
+        .optional()
+        .map_err(|error| format!("failed to inspect Guardian finding: {error}"))?
+        .is_some();
+    if !finding_exists {
+        return Err("Guardian finding is not present in local evidence storage".into());
+    }
+    transaction
+        .execute(
+            "UPDATE guardian_suppression SET status = 'expired'
+             WHERE status = 'active' AND expires_at <= ?1",
+            [now.to_rfc3339()],
+        )
+        .map_err(|error| format!("failed to expire Guardian suppressions: {error}"))?;
+    if transaction
+        .query_row(
+            "SELECT 1 FROM guardian_suppression
+             WHERE finding_id = ?1 AND status = 'active' LIMIT 1",
+            [&input.finding_id],
+            |_| Ok(()),
+        )
+        .optional()
+        .map_err(|error| format!("failed to inspect Guardian suppressions: {error}"))?
+        .is_some()
+    {
+        return Err("this finding already has an active suppression".into());
+    }
+    let actor = owner_pubkey(&app)?;
+    let suppression_id = uuid::Uuid::new_v4().to_string();
+    let starts_at = now.to_rfc3339();
+    let expires_at = expiry.to_rfc3339();
+    transaction
+        .execute(
+            "INSERT INTO guardian_suppression(
+               suppression_id, schema_version, version, agent_pubkey, finding_id,
+               reason, created_by, starts_at, expires_at, status
+             ) VALUES (?1, 'guardian.suppression/v1', 1, ?2, ?3, ?4, ?5, ?6, ?7, 'active')",
+            params![
+                suppression_id,
+                input.agent_pubkey,
+                input.finding_id,
+                reason,
+                actor,
+                starts_at,
+                expires_at,
+            ],
+        )
+        .map_err(|error| format!("failed to create Guardian suppression: {error}"))?;
+    append_action(
+        &transaction,
+        Some(&input.finding_id),
+        None,
+        "suppression_created",
+        &actor,
+        reason,
+        &starts_at,
+    )?;
+    transaction
+        .commit()
+        .map_err(|error| format!("failed to commit Guardian suppression: {error}"))?;
+    Ok(GuardianSuppressionProjection {
+        suppression_id,
+        finding_id: input.finding_id,
+        reason: reason.to_string(),
+        starts_at,
+        expires_at,
+        status: "active".into(),
+    })
+}
+
+#[tauri::command]
+pub fn list_guardian_suppressions(
+    app: AppHandle,
+    agent_pubkey: String,
+) -> Result<Vec<GuardianSuppressionProjection>, String> {
+    let connection = open_store(&app)?;
+    let now = Utc::now().to_rfc3339();
+    connection
+        .execute(
+            "UPDATE guardian_suppression SET status = 'expired'
+             WHERE status = 'active' AND expires_at <= ?1",
+            [&now],
+        )
+        .map_err(|error| format!("failed to expire Guardian suppressions: {error}"))?;
+    let mut statement = connection
+        .prepare(
+            "SELECT suppression_id, finding_id, reason, starts_at, expires_at, status
+             FROM guardian_suppression WHERE agent_pubkey = ?1 ORDER BY starts_at DESC",
+        )
+        .map_err(|error| format!("failed to prepare Guardian suppression query: {error}"))?;
+    let rows = statement
+        .query_map([agent_pubkey], |row| {
+            Ok(GuardianSuppressionProjection {
+                suppression_id: row.get(0)?,
+                finding_id: row.get(1)?,
+                reason: row.get(2)?,
+                starts_at: row.get(3)?,
+                expires_at: row.get(4)?,
+                status: row.get(5)?,
+            })
+        })
+        .map_err(|error| format!("failed to list Guardian suppressions: {error}"))?;
+    rows.map(|row| row.map_err(|error| format!("failed to read Guardian suppression: {error}")))
+        .collect()
+}
+
+fn valid_case_transition(current: &str, next: &str) -> bool {
+    matches!(
+        (current, next),
+        ("new", "triaged")
+            | ("triaged", "investigating")
+            | ("investigating", "resolved")
+            | ("resolved", "closed")
+            | ("new" | "triaged" | "investigating", "duplicate")
+            | ("new" | "triaged" | "investigating", "false_positive")
+            | ("new" | "triaged" | "investigating", "accepted_risk")
+            | ("closed", "reopened")
+            | ("reopened", "investigating")
+    )
+}
+
 fn severity_rank(value: &str) -> u8 {
     match value {
         "critical" => 4,
@@ -446,5 +739,13 @@ mod tests {
             .unwrap();
         assert!(previous.is_some());
         assert_eq!(count, 2);
+    }
+
+    #[test]
+    fn case_lifecycle_rejects_skips_and_allows_reopen() {
+        assert!(valid_case_transition("new", "triaged"));
+        assert!(!valid_case_transition("new", "closed"));
+        assert!(valid_case_transition("closed", "reopened"));
+        assert!(valid_case_transition("investigating", "false_positive"));
     }
 }

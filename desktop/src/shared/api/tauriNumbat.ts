@@ -46,6 +46,15 @@ export type GuardianCase = {
   updatedAt: string;
 };
 
+export type GuardianSuppression = {
+  suppressionId: string;
+  findingId: string;
+  reason: string;
+  startsAt: string;
+  expiresAt: string;
+  status: "active" | "expired";
+};
+
 export function getGuardianNumbatStatus(): Promise<GuardianNumbatStatus> {
   return invokeTauri<GuardianNumbatStatus>("get_guardian_numbat_status");
 }
@@ -114,4 +123,32 @@ export function listGuardianCases(
   agentPubkey: string,
 ): Promise<GuardianCase[]> {
   return invokeTauri<GuardianCase[]>("list_guardian_cases", { agentPubkey });
+}
+
+export function updateGuardianCaseStatus(
+  caseId: string,
+  status: string,
+): Promise<GuardianCase> {
+  return invokeTauri<GuardianCase>("update_guardian_case_status", {
+    input: { caseId, status },
+  });
+}
+
+export function createGuardianSuppression(
+  agentPubkey: string,
+  findingId: string,
+  reason: string,
+  expiresAt: string,
+): Promise<GuardianSuppression> {
+  return invokeTauri<GuardianSuppression>("create_guardian_suppression", {
+    input: { agentPubkey, findingId, reason, expiresAt },
+  });
+}
+
+export function listGuardianSuppressions(
+  agentPubkey: string,
+): Promise<GuardianSuppression[]> {
+  return invokeTauri<GuardianSuppression[]>("list_guardian_suppressions", {
+    agentPubkey,
+  });
 }

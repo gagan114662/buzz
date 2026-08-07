@@ -12920,6 +12920,8 @@ export function maybeInstallE2eTauriMocks() {
         return `mock-action-${String((payload as { findingId?: string }).findingId ?? "finding")}`;
       case "list_guardian_cases":
         return [];
+      case "list_guardian_suppressions":
+        return [];
       case "create_guardian_case": {
         const request = (
           payload as {
@@ -12937,6 +12939,27 @@ export function maybeInstallE2eTauriMocks() {
           updatedAt: now,
         };
       }
+      case "create_guardian_suppression": {
+        const request = (
+          payload as {
+            input?: {
+              findingId?: string;
+              reason?: string;
+              expiresAt?: string;
+            };
+          }
+        ).input;
+        return {
+          suppressionId: "mock-guardian-suppression",
+          findingId: request?.findingId ?? "finding",
+          reason: request?.reason ?? "reviewed",
+          startsAt: new Date().toISOString(),
+          expiresAt: request?.expiresAt ?? new Date().toISOString(),
+          status: "active",
+        };
+      }
+      case "update_guardian_case_status":
+        throw new Error("No mock Guardian case is persisted");
       case "set_prevent_sleep_active":
         return null;
       case "plugin:window|is_fullscreen":
