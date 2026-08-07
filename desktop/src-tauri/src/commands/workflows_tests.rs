@@ -255,23 +255,3 @@ fn approval_response_rejects_mismatched_decisions_and_tokens() {
         "approval response status does not match request"
     );
 }
-
-#[test]
-fn runs_and_approvals_serialize_to_bare_empty_array() {
-    // Regression guard for the crash class this fix closed. The frontend
-    // wrappers `getWorkflowRuns` / `getRunApprovals` do `raw.map(...)`, so the
-    // Rust side MUST return a bare JSON array. A wrapped `{ runs: [...] }` /
-    // `{ approvals: [...] }` shape would make `.map()` throw and crash the
-    // detail panel — the same TypeError class as the original page bug.
-    //
-    // The commands take `State<AppState>`, so we can't invoke them directly in
-    // a unit test; instead we pin the exact value they return (`Vec::new()` of
-    // their `Vec<Value>` element type) and assert its serialized shape.
-    let runs: Vec<Value> = Vec::new();
-    let approvals: Vec<Value> = Vec::new();
-    assert_eq!(serde_json::to_string(&runs).expect("serialize runs"), "[]");
-    assert_eq!(
-        serde_json::to_string(&approvals).expect("serialize approvals"),
-        "[]"
-    );
-}

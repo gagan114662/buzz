@@ -1386,6 +1386,162 @@ pub async fn count_events(
     result
 }
 
+const WORKFLOW_RUN_READ_LIMIT: i64 = 100;
+
+#[derive(serde::Deserialize, Default)]
+/// Query controls for the workflow-run history endpoint.
+pub struct WorkflowRunReadQuery {
+    limit: Option<i64>,
+}
+
+fn clamp_workflow_run_limit(requested: Option<i64>) -> i64 {
+    requested
+        .filter(|value| *value > 0)
+        .map(|value| value.min(WORKFLOW_RUN_READ_LIMIT))
+        .unwrap_or(WORKFLOW_RUN_READ_LIMIT)
+}
+
+async fn authorize_workflow_read(
+    state: &Arc<AppState>,
+    headers: &HeaderMap,
+    path: &str,
+    raw_query: Option<&str>,
+    workflow_id: uuid::Uuid,
+) -> Result<(TenantContext, buzz_db::workflow::WorkflowRecord), (StatusCode, Json<Value>)> {
+    let raw_host = headers
+        .get(axum::http::header::HOST)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("");
+    let tenant = crate::tenant::bind_community(&state.db, raw_host)
+        .await
+        .map_err(|_| {
+            api_error(
+                StatusCode::NOT_FOUND,
+                "relay: no community is configured for this host",
+            )
+        })?;
+    let path_with_query = match raw_query {
+        Some(query) if !query.is_empty() => format!("{path}?{query}"),
+        _ => path.to_string(),
+    };
+    let url = nip98_expected_url(&state.config.relay_url, &tenant, &path_with_query);
+    let (pubkey, event_id_bytes) =
+        verify_bridge_auth(headers, "GET", &url, None, state.config.require_auth_token)?;
+    enforce_http_admission(state, &tenant, &pubkey).await?;
+    check_nip98_replay(state, &tenant, event_id_bytes).await?;
+    let pubkey_bytes = pubkey.to_bytes().to_vec();
+    let auth_tag = headers
+        .get("x-auth-tag")
+        .and_then(|value| value.to_str().ok());
+    super::relay_members::enforce_relay_membership(
+        state,
+        tenant.community(),
+        &pubkey_bytes,
+        auth_tag,
+    )
+    .await?;
+
+    let workflow = state
+        .db
+        .get_workflow(tenant.community(), workflow_id)
+        .await
+        .map_err(|_| not_found("workflow not found"))?;
+    let channel_id = workflow
+        .channel_id
+        .ok_or_else(|| api_error(StatusCode::FORBIDDEN, "workflow has no channel scope"))?;
+    let role = state
+        .db
+        .get_member_role(tenant.community(), channel_id, &pubkey_bytes)
+        .await
+        .map_err(|error| internal_error(&format!("workflow access lookup: {error}")))?;
+    if role.is_none() {
+        return Err(api_error(
+            StatusCode::FORBIDDEN,
+            "workflow channel membership required",
+        ));
+    }
+
+    Ok((tenant, workflow))
+}
+
+fn workflow_run_json(run: &buzz_db::workflow::WorkflowRunRecord) -> Value {
+    serde_json::json!({
+        "id": run.id.to_string(),
+        "workflow_id": run.workflow_id.to_string(),
+        "status": run.status.to_string(),
+        "current_step": run.current_step,
+        "execution_trace": run.execution_trace,
+        "started_at": run.started_at.map(|value| value.timestamp()),
+        "completed_at": run.completed_at.map(|value| value.timestamp()),
+        "error_message": run.error_message,
+        "created_at": run.created_at.timestamp(),
+    })
+}
+
+fn workflow_approval_json(approval: &buzz_db::workflow::ApprovalRecord) -> Value {
+    serde_json::json!({
+        "token": hex::encode(&approval.token),
+        "workflow_id": approval.workflow_id.to_string(),
+        "run_id": approval.run_id.to_string(),
+        "step_id": approval.step_id,
+        "step_index": approval.step_index,
+        "approver_spec": approval.approver_spec,
+        "status": approval.status.to_string(),
+        "approver_pubkey": approval.approver_pubkey.as_ref().map(hex::encode),
+        "note": approval.note,
+        "expires_at": approval.expires_at.to_rfc3339(),
+        "created_at": approval.created_at.timestamp(),
+    })
+}
+
+/// Authoritative workflow-run history for an accessible channel workflow.
+pub async fn workflow_runs(
+    State(state): State<Arc<AppState>>,
+    Path(workflow_id): Path<uuid::Uuid>,
+    headers: HeaderMap,
+    RawQuery(raw_query): RawQuery,
+    Query(query): Query<WorkflowRunReadQuery>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let path = format!("/api/workflows/{workflow_id}/runs");
+    let (tenant, _) =
+        authorize_workflow_read(&state, &headers, &path, raw_query.as_deref(), workflow_id).await?;
+    let limit = clamp_workflow_run_limit(query.limit);
+    let runs = state
+        .db
+        .list_workflow_runs(tenant.community(), workflow_id, limit)
+        .await
+        .map_err(|error| internal_error(&format!("list workflow runs: {error}")))?;
+    Ok(Json(Value::Array(
+        runs.iter().map(workflow_run_json).collect(),
+    )))
+}
+
+/// Approval records for one authoritative workflow run.
+pub async fn workflow_run_approvals(
+    State(state): State<Arc<AppState>>,
+    Path((workflow_id, run_id)): Path<(uuid::Uuid, uuid::Uuid)>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let path = format!("/api/workflows/{workflow_id}/runs/{run_id}/approvals");
+    let (tenant, _) = authorize_workflow_read(&state, &headers, &path, None, workflow_id).await?;
+    let run = state
+        .db
+        .get_workflow_run(tenant.community(), run_id)
+        .await
+        .map_err(|_| not_found("workflow run not found"))?;
+    if run.workflow_id != workflow_id {
+        return Err(not_found("workflow run not found"));
+    }
+    let approvals = state
+        .db
+        .get_run_approvals(tenant.community(), workflow_id, run_id)
+        .await
+        .map_err(|error| internal_error(&format!("list workflow approvals: {error}")))?;
+    Ok(Json(Value::Array(
+        approvals.iter().map(workflow_approval_json).collect(),
+    )))
+}
+
 /// Filter execution for [`count_events`], run once NIP-98 auth succeeds.
 /// Handles admission, replay, membership, and count execution so the thin
 /// wrapper above can emit exactly one terminal attribution line from the Result.
@@ -2265,6 +2421,80 @@ mod tests {
             .expect("sign auth event")
             .id
             .to_bytes()
+    }
+
+    #[test]
+    fn workflow_read_limit_is_positive_and_bounded() {
+        assert_eq!(clamp_workflow_run_limit(None), 100);
+        assert_eq!(clamp_workflow_run_limit(Some(0)), 100);
+        assert_eq!(clamp_workflow_run_limit(Some(-1)), 100);
+        assert_eq!(clamp_workflow_run_limit(Some(25)), 25);
+        assert_eq!(clamp_workflow_run_limit(Some(500)), 100);
+    }
+
+    #[test]
+    fn workflow_run_json_matches_the_desktop_wire_contract() {
+        let workflow_id = uuid::Uuid::new_v4();
+        let run_id = uuid::Uuid::new_v4();
+        let now = chrono::Utc::now();
+        let run = buzz_db::workflow::WorkflowRunRecord {
+            id: run_id,
+            community_id: buzz_core::CommunityId::from_uuid(uuid::Uuid::new_v4()),
+            workflow_id,
+            status: buzz_db::workflow::RunStatus::WaitingApproval,
+            trigger_event_id: None,
+            current_step: 2,
+            execution_trace: serde_json::json!([{"step_id": "review", "status": "running"}]),
+            trigger_context: None,
+            started_at: Some(now),
+            completed_at: None,
+            error_message: None,
+            created_at: now,
+        };
+        let value = workflow_run_json(&run);
+
+        assert_eq!(value["id"], run_id.to_string());
+        assert_eq!(value["workflow_id"], workflow_id.to_string());
+        assert_eq!(value["status"], "waiting_approval");
+        assert_eq!(value["current_step"], 2);
+        assert!(value["execution_trace"].is_array());
+        assert!(value["started_at"].is_i64());
+        assert!(value["completed_at"].is_null());
+        assert!(value["error_message"].is_null());
+        assert!(value["created_at"].is_i64());
+    }
+
+    #[test]
+    fn workflow_approval_json_matches_the_desktop_wire_contract() {
+        let workflow_id = uuid::Uuid::new_v4();
+        let run_id = uuid::Uuid::new_v4();
+        let now = chrono::Utc::now();
+        let approval = buzz_db::workflow::ApprovalRecord {
+            token: vec![0xab; 32],
+            workflow_id,
+            run_id,
+            step_id: "review".to_string(),
+            step_index: 2,
+            approver_spec: "any".to_string(),
+            status: buzz_db::workflow::ApprovalStatus::Pending,
+            approver_pubkey: None,
+            note: None,
+            expires_at: now,
+            created_at: now,
+        };
+        let value = workflow_approval_json(&approval);
+
+        assert_eq!(value["token"], "ab".repeat(32));
+        assert_eq!(value["workflow_id"], workflow_id.to_string());
+        assert_eq!(value["run_id"], run_id.to_string());
+        assert_eq!(value["step_id"], "review");
+        assert_eq!(value["step_index"], 2);
+        assert_eq!(value["approver_spec"], "any");
+        assert_eq!(value["status"], "pending");
+        assert!(value["approver_pubkey"].is_null());
+        assert!(value["note"].is_null());
+        assert!(value["expires_at"].is_string());
+        assert!(value["created_at"].is_i64());
     }
 
     #[test]
