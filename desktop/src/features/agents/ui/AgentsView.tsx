@@ -37,6 +37,8 @@ import {
 } from "@/shared/ui/dropdown-menu";
 import { PageHeader } from "@/shared/ui/PageHeader";
 import { getInheritedAgentDefaults } from "./bakedEnvHelpers";
+import { OutcomeAssistantStarter } from "./OutcomeAssistantStarter";
+import type { CreatePersonaInput } from "@/shared/api/types";
 
 export function AgentsView() {
   const { openPersonaProfilePanel, openProfilePanel } = useProfilePanel();
@@ -53,9 +55,18 @@ export function AgentsView() {
   // Exclusivity: create never sets `personaDialogState` (edit/dup/import do),
   // so the create-mode and definition-edit AgentDialog mounts never coexist.
   const [isCreateDialogOpen, setIsCreateDialogOpen] = React.useState(false);
+  const [createInitialValues, setCreateInitialValues] =
+    React.useState<CreatePersonaInput | null>(null);
 
   function openUnifiedCreate() {
     personas.prepareCreate();
+    setCreateInitialValues(null);
+    setIsCreateDialogOpen(true);
+  }
+
+  function openOutcomeCreate(initialValues: CreatePersonaInput) {
+    personas.prepareCreate();
+    setCreateInitialValues(initialValues);
     setIsCreateDialogOpen(true);
   }
 
@@ -211,6 +222,7 @@ export function AgentsView() {
             description="Set up and manage your agents."
             title="Agents"
           />
+          <OutcomeAssistantStarter onStart={openOutcomeCreate} />
           <div className="flex flex-col gap-8">
             <UnifiedAgentsSection
               defaultModel={inheritedDefaults.model.value}
@@ -311,6 +323,7 @@ export function AgentsView() {
 
       {isCreateDialogOpen ? (
         <AgentDialog
+          initialValues={createInitialValues}
           definitionError={
             personas.createPersonaMutation.error instanceof Error
               ? personas.createPersonaMutation.error
