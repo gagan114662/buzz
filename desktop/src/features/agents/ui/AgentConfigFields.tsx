@@ -62,7 +62,11 @@ import { SettingsOptionGroup } from "@/features/settings/ui/SettingsOptionGroup"
 import { AdvancedRequiredBadge } from "./AdvancedRequiredBadge";
 import { CardMintKeyCue } from "./CardMintKeyCue";
 import { GuardianPolicyField } from "./GuardianPolicyField";
-import { GUARDIAN_POLICY_ENV } from "./guardianPolicy";
+import {
+  getGenericEnvVars,
+  GUARDIAN_POLICY_ENV,
+  mergeGenericEnvVars,
+} from "./guardianPolicy";
 import { getGlobalAgentCredentialState } from "./globalAgentCredentialState";
 export const EMPTY_GLOBAL_CONFIG: GlobalAgentConfig = {
   env_vars: {},
@@ -86,14 +90,7 @@ type AgentConfigDisclosure =
   | "onboarding-essential"
   | "progressive-defaults";
 
-// Canonical behaviors (PR 2 flag cleanup). These were per-surface props;
-// onboarding's values won every call and are now the only behavior:
-// - auto-select a valid model when the provider changes
-// - keep the model select usable during discovery
-// - preserve credential env vars across provider switches (the abandoned
-//   provider's key stays in env_vars — visible/deletable under Advanced)
-// - require a provider before model/effort are editable (no saveable
-//   invalid state — design principle #4)
+// Canonical onboarding behavior shared by every agent-config surface.
 const autoSelectModelOnProviderChange = true;
 const disableModelSelectDuringDiscovery = false;
 const preserveCredentialEnvVarsOnProviderChange = true;
@@ -576,7 +573,10 @@ export function AgentConfigFields({
   }
 
   function handleEnvVarsChange(next: Record<string, string>) {
-    onConfigChange({ ...config, env_vars: next });
+    onConfigChange({
+      ...config,
+      env_vars: mergeGenericEnvVars(config.env_vars, next),
+    });
   }
 
   const handleNumericEnvVarChange = (key: string, value: string) => {
@@ -755,7 +755,7 @@ export function AgentConfigFields({
         label="Environment variables"
         onChange={handleEnvVarsChange}
         requiredKeys={advancedRequiredEnvKeys}
-        value={config.env_vars}
+        value={getGenericEnvVars(config.env_vars)}
       />
       {numericDescriptors.length > 0 ? (
         <NumericTuningFields

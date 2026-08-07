@@ -7,6 +7,7 @@ import {
   fromRawInstallRuntimeResult,
   type RawInstallRuntimeResult,
 } from "@/shared/api/installTypes";
+import { fromRawGuardianProtection } from "@/shared/api/guardianProtection";
 import type {
   AddChannelMembersInput,
   AddChannelMembersResult,
@@ -43,7 +44,6 @@ import type {
 } from "@/shared/api/types";
 
 export * from "@/shared/api/tauriChannels";
-
 type RawPresenceLookup = Record<string, PresenceStatus>;
 
 type RawAddChannelMembersResult = {
@@ -163,7 +163,6 @@ export type RawManagedAgent = {
   respond_to?: ManagedAgent["respondTo"];
   respond_to_allowlist?: string[];
 };
-
 type RawCreateManagedAgentResponse = {
   agent: RawManagedAgent;
   private_key_nsec: string;
@@ -175,7 +174,6 @@ type RawManagedAgentLog = {
   content: string;
   log_path: string;
 };
-
 export type RawAcpRuntimeCatalogEntry = {
   id: string;
   label: string;
@@ -205,6 +203,7 @@ export type RawAcpRuntimeCatalogEntry = {
   /** Definition-level env vars for `source: custom` entries; absent for builtin/preset. */
   definition_env?: Record<string, string>;
   max_parallelism?: number;
+  guardian_protection?: import("./guardianProtection").RawGuardianProtection;
 };
 
 export type {
@@ -761,6 +760,7 @@ export function fromRawAcpRuntimeCatalogEntry(
     loginHint: entry.login_hint ?? null,
     source: entry.source,
     definitionEnv: entry.definition_env ?? {},
+    guardianProtection: fromRawGuardianProtection(entry.guardian_protection),
     ...(entry.max_parallelism !== undefined && {
       maxParallelism: entry.max_parallelism,
     }),

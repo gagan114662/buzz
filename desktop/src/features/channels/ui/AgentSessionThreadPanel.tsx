@@ -68,6 +68,7 @@ import type { ChannelAgentSessionAgent } from "./useChannelAgentSessions";
 import { useChannelsQuery } from "@/features/channels/hooks";
 import { CausalSessionTimeline } from "@/features/agents/ui/CausalSessionTimeline";
 import { CausalCandidateCard } from "@/features/agents/ui/CausalCandidateCard";
+import { AgentFailureReplay } from "@/features/agents/ui/AgentFailureReplay";
 import { NumbatSecurityFindings } from "@/features/agents/ui/NumbatSecurityFindings";
 import { useNumbatFindings } from "@/features/agents/ui/useNumbatFindings";
 
@@ -576,6 +577,7 @@ export function AgentSessionThreadPanel({
             />
           ) : null}
           <CausalSessionTimeline events={combinedHeaderEvents} findings={[]} />
+          <AgentFailureReplay events={combinedHeaderEvents} />
           <CausalCandidateCard
             agentPubkey={agent.pubkey}
             channelId={sessionChannelId}
