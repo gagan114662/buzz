@@ -1,9 +1,9 @@
 use std::process::Command;
 
-use crate::managed_agents::{resolve_command, KnownAcpRuntime, ManagedAgentRecord};
 use crate::managed_agents::access_policy::{
     build_respond_to_env_with_policy, owner_only, RespondToEnv,
 };
+use crate::managed_agents::{resolve_command, KnownAcpRuntime, ManagedAgentRecord};
 
 /// Pure decision function for the inbound author gate env vars.
 ///

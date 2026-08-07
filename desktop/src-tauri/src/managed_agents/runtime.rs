@@ -32,6 +32,8 @@ mod sweep;
 pub(crate) use sweep::sweep_untracked_bundle_harnesses;
 
 mod env_config;
+#[cfg(test)]
+use crate::managed_agents::access_policy::build_respond_to_env_with_policy;
 pub(crate) use env_config::{build_respond_to_env, configure_runtime_cli};
 
 mod process;
@@ -975,9 +977,9 @@ pub fn start_managed_agent_process(
     Ok(())
 }
 
+mod guardian_policy_tests;
 #[cfg(test)]
 mod test_fixtures;
-mod guardian_policy_tests;
 
 #[cfg(test)]
 mod tests;

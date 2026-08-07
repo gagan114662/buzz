@@ -307,6 +307,7 @@ mod tests {
             command: "openclaw".into(),
             args: vec![],
             env: BTreeMap::new(),
+            guardian_policy: GuardianPermissionPolicy::Monitor,
         };
 
         let launch = build_launch_block(&record, &descriptor, &[], None, None, "owner-hex");
@@ -329,6 +330,7 @@ mod tests {
             command: "goose".into(),
             args: vec![],
             env: BTreeMap::new(),
+            guardian_policy: GuardianPermissionPolicy::Monitor,
         };
 
         let launch = build_launch_block(&record, &descriptor, &[], None, None, "owner-hex");
@@ -358,6 +360,7 @@ mod tests {
             command: "openclaw".into(),
             args: vec![],
             env: BTreeMap::new(),
+            guardian_policy: GuardianPermissionPolicy::Monitor,
         };
         let cap = crate::managed_agents::parallelism::OPENCLAW_MAX_PARALLELISM;
 
@@ -404,6 +407,7 @@ mod tests {
             command: "goose".into(),
             args: vec![],
             env: BTreeMap::new(),
+            guardian_policy: GuardianPermissionPolicy::Monitor,
         };
 
         let launch = build_launch_block(&record, &descriptor, &[], None, None, "owner-hex");
@@ -449,6 +453,7 @@ mod tests {
             command: "openclaw".into(),
             args: vec![],
             env: BTreeMap::new(),
+            guardian_policy: GuardianPermissionPolicy::Monitor,
         };
         let cap = crate::managed_agents::parallelism::OPENCLAW_MAX_PARALLELISM;
 

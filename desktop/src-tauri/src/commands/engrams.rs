@@ -340,10 +340,16 @@ pub async fn review_agent_memory_proposal(
     let record = records
         .iter()
         .find(|record| record.pubkey.eq_ignore_ascii_case(&input.agent_pubkey))
-        .ok_or_else(|| "memory proposals can only be reviewed for a locally managed agent".to_string())?;
+        .ok_or_else(|| {
+            "memory proposals can only be reviewed for a locally managed agent".to_string()
+        })?;
     let agent_keys = nostr::Keys::parse(record.private_key_nsec.trim())
         .map_err(|_| "managed agent signing key is unavailable".to_string())?;
-    if !agent_keys.public_key().to_hex().eq_ignore_ascii_case(&input.agent_pubkey) {
+    if !agent_keys
+        .public_key()
+        .to_hex()
+        .eq_ignore_ascii_case(&input.agent_pubkey)
+    {
         return Err("managed agent signing key does not match the proposal agent".into());
     }
     let (owner_pubkey, now) = {
@@ -357,7 +363,9 @@ pub async fn review_agent_memory_proposal(
     };
 
     if input.decision == "approve" {
-        let value = input.edited_content.unwrap_or_else(|| proposal.content.clone());
+        let value = input
+            .edited_content
+            .unwrap_or_else(|| proposal.content.clone());
         if value.trim().is_empty() {
             return Err("approved memory cannot be empty".into());
         }

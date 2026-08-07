@@ -5,6 +5,7 @@ mod archive;
 mod builderlab;
 mod commands;
 mod deep_link;
+mod durable_tasks;
 mod egress_guard;
 mod event_sync;
 mod events;
