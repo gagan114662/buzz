@@ -36,6 +36,16 @@ export type GuardianNumbatStatus = {
   detail: string;
 };
 
+export type GuardianCase = {
+  caseId: string;
+  title: string;
+  status: string;
+  severity: NumbatFindingSeverity;
+  findingIds: string[];
+  openedAt: string;
+  updatedAt: string;
+};
+
 export function getGuardianNumbatStatus(): Promise<GuardianNumbatStatus> {
   return invokeTauri<GuardianNumbatStatus>("get_guardian_numbat_status");
 }
@@ -78,4 +88,30 @@ export function readNumbatFindings(
     channelId,
     turnId,
   });
+}
+
+export function acknowledgeGuardianFinding(
+  agentPubkey: string,
+  findingId: string,
+): Promise<string> {
+  return invokeTauri<string>("acknowledge_guardian_finding", {
+    agentPubkey,
+    findingId,
+  });
+}
+
+export function createGuardianCase(
+  agentPubkey: string,
+  findingIds: string[],
+  title: string,
+): Promise<GuardianCase> {
+  return invokeTauri<GuardianCase>("create_guardian_case", {
+    input: { agentPubkey, findingIds, title },
+  });
+}
+
+export function listGuardianCases(
+  agentPubkey: string,
+): Promise<GuardianCase[]> {
+  return invokeTauri<GuardianCase[]>("list_guardian_cases", { agentPubkey });
 }

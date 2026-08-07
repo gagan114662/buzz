@@ -36,16 +36,16 @@ static NUMBAT_VERIFICATION_BASELINES: OnceLock<Mutex<HashMap<String, (u64, u64)>
 #[derive(Debug, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct NumbatFindingProjection {
-    finding_id: String,
-    rule_id: String,
-    title: String,
-    severity: String,
-    detected_at: String,
-    source_agent: String,
-    session_id: Option<String>,
-    channel_id: Option<String>,
-    turn_id: Option<String>,
-    evidence_count: usize,
+    pub(crate) finding_id: String,
+    pub(crate) rule_id: String,
+    pub(crate) title: String,
+    pub(crate) severity: String,
+    pub(crate) detected_at: String,
+    pub(crate) source_agent: String,
+    pub(crate) session_id: Option<String>,
+    pub(crate) channel_id: Option<String>,
+    pub(crate) turn_id: Option<String>,
+    pub(crate) evidence_count: usize,
 }
 
 #[derive(Debug, Serialize, PartialEq, Eq)]
@@ -838,6 +838,7 @@ pub fn read_numbat_findings(
         batch.health = active_health();
         write_health(&app, &agent_pubkey, &batch.health);
     }
+    super::guardian_cases::persist_finding_projections(&app, &batch.findings)?;
     Ok(batch)
 }
 

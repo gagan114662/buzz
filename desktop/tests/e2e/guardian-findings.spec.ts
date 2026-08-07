@@ -87,4 +87,18 @@ test("renders three privacy-projected Guardian alerts", async ({ page }) => {
   await expect(guardian).toContainText("HIGH");
   await expect(guardian).not.toContainText("observed_command");
   await expect(guardian).not.toContainText("/private/");
+
+  const highFinding = guardian.locator('[data-finding-id="finding-high"]');
+  await highFinding.getByTestId("guardian-acknowledge-finding").click();
+  await expect(
+    highFinding.getByTestId("guardian-acknowledge-finding"),
+  ).toHaveText("Acknowledged");
+
+  await highFinding.getByTestId("guardian-create-case").click();
+  await expect(highFinding.getByTestId("guardian-create-case")).toHaveText(
+    "Case opened",
+  );
+  await expect(guardian.getByTestId("guardian-case-count")).toContainText(
+    "1 local investigation case",
+  );
 });

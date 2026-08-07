@@ -575,16 +575,14 @@ export function AgentSessionThreadPanel({
               sessionId={latestSessionId}
             />
           ) : null}
-          <CausalSessionTimeline
-            events={combinedHeaderEvents}
-            findings={[]}
-          />
+          <CausalSessionTimeline events={combinedHeaderEvents} findings={[]} />
           <CausalCandidateCard
             agentPubkey={agent.pubkey}
             channelId={sessionChannelId}
             sessionId={activeSessionId}
           />
           <NumbatSecurityFindings
+            agentPubkey={agent.pubkey}
             error={numbatFindings.error}
             findings={numbatFindings.findings}
             health={numbatFindings.health}

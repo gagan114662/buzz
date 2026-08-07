@@ -12916,6 +12916,27 @@ export function maybeInstallE2eTauriMocks() {
             findings: [],
           }
         );
+      case "acknowledge_guardian_finding":
+        return `mock-action-${String((payload as { findingId?: string }).findingId ?? "finding")}`;
+      case "list_guardian_cases":
+        return [];
+      case "create_guardian_case": {
+        const request = (
+          payload as {
+            input?: { findingIds?: string[]; title?: string };
+          }
+        ).input;
+        const now = new Date().toISOString();
+        return {
+          caseId: "mock-guardian-case",
+          title: request?.title ?? "Guardian investigation",
+          status: "new",
+          severity: "high",
+          findingIds: request?.findingIds ?? [],
+          openedAt: now,
+          updatedAt: now,
+        };
+      }
       case "set_prevent_sleep_active":
         return null;
       case "plugin:window|is_fullscreen":
