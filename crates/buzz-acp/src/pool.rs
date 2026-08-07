@@ -104,6 +104,11 @@ pub struct SessionState {
     /// fetch fails — all fail open. Cleared on session invalidation alongside
     /// `core_sections` so the next session picks up any canvas change.
     pub canvas_sections: HashMap<Uuid, String>,
+    /// Locally decrypted cold-memory heads used for relevance retrieval.
+    /// The short TTL makes new memories visible without a relay round-trip on
+    /// every turn. Plaintext never leaves this process except for the few
+    /// bounded items injected into the owning agent's prompt.
+    pub recall_cache: Option<(std::time::Instant, Vec<crate::engram_fetch::RecallMemory>)>,
 }
 
 impl SessionState {
@@ -137,6 +142,7 @@ impl SessionState {
         self.heartbeat_turn_count = 0;
         self.core_sections.clear();
         self.canvas_sections.clear();
+        self.recall_cache = None;
     }
 
     #[cfg(test)]
@@ -1908,7 +1914,59 @@ pub async fn run_prompt_task(
             );
         }
 
-        crate::queue::format_prompt(
+        // Pieces-inspired contextual recall: cold memories remain encrypted on
+        // the relay, are decrypted and ranked locally, and only the small set
+        // relevant to this turn enters the prompt. A short cache avoids making
+        // every human message wait on the relay while still picking up newly
+        // written memories promptly.
+        let recall_section = if ctx.memory_enabled {
+            if let (Some(owner), Some(last_event)) =
+                (ctx.agent_owner_pubkey.as_ref(), b.events.last())
+            {
+                const RECALL_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(60);
+                const RECALL_FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+                let cache_is_fresh = agent
+                    .state
+                    .recall_cache
+                    .as_ref()
+                    .map(|(loaded_at, _)| loaded_at.elapsed() < RECALL_CACHE_TTL)
+                    .unwrap_or(false);
+                if !cache_is_fresh {
+                    match tokio::time::timeout(
+                        RECALL_FETCH_TIMEOUT,
+                        crate::engram_fetch::fetch_recall_memories(
+                            &ctx.rest_client,
+                            &ctx.agent_keys,
+                            owner,
+                        ),
+                    )
+                    .await
+                    {
+                        Ok(Ok(memories)) => {
+                            agent.state.recall_cache = Some((std::time::Instant::now(), memories));
+                        }
+                        Ok(Err(reason)) => tracing::warn!(
+                            target: "engram::recall",
+                            "memory recall fetch failed: {reason}"
+                        ),
+                        Err(_) => tracing::warn!(
+                            target: "engram::recall",
+                            timeout_ms = RECALL_FETCH_TIMEOUT.as_millis() as u64,
+                            "memory recall fetch timed out"
+                        ),
+                    }
+                }
+                agent.state.recall_cache.as_ref().and_then(|(_, memories)| {
+                    crate::engram_fetch::build_recall_section(memories, &last_event.event.content)
+                })
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        let mut sections = crate::queue::format_prompt(
             b,
             &crate::queue::FormatPromptArgs {
                 agent_core: agent_core.as_deref(),
@@ -1921,7 +1979,15 @@ pub async fn run_prompt_task(
                 team_instructions: ctx.team_instructions.as_deref(),
                 agent_canvas: agent_canvas.as_deref(),
             },
-        )
+        );
+        if let Some(section) = recall_section {
+            let context_index = sections
+                .iter()
+                .position(|item| item.starts_with("[Context]"))
+                .unwrap_or(0);
+            sections.insert(context_index, section);
+        }
+        sections
     } else {
         // Should not happen — batch is None only for heartbeats which have prompt_text.
         // Return the agent to the pool to prevent a permanent slot leak.

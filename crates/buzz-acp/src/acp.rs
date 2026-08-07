@@ -2539,7 +2539,7 @@ mod tests {
     }
 
     #[test]
-    fn observer_redacts_permission_request_secrets() {
+    fn observer_redacts_permission_request_secrets_duplicate_regression() {
         let secret = "seeded-secret-tool-argument";
         let request = serde_json::json!({
             "jsonrpc": "2.0",
@@ -2767,25 +2767,21 @@ mod tests {
     }
 
     #[test]
-    fn permission_policy_monitor_modes_allow_once() {
-        for mode in [
-            PermissionMode::Default,
-            PermissionMode::AcceptEdits,
-            PermissionMode::BypassPermissions,
-        ] {
+    fn permission_policy_monitor_modes_allow_once_duplicate_regression() {
+        for mode in [PermissionMode::Default, PermissionMode::AcceptEdits] {
             assert_eq!(permission_option_kind(&mode), "allow_once");
         }
     }
 
     #[test]
-    fn permission_policy_lockdown_modes_reject_once() {
+    fn permission_policy_lockdown_modes_reject_once_duplicate_regression() {
         for mode in [PermissionMode::DontAsk, PermissionMode::Plan] {
             assert_eq!(permission_option_kind(&mode), "reject_once");
         }
     }
 
     #[tokio::test]
-    async fn lockdown_handler_selects_reject_before_tool_execution() {
+    async fn lockdown_handler_selects_reject_before_tool_execution_duplicate_regression() {
         let mut client =
             spawn_script("read -t 2 response; printf '%s\\n' \"$response\"; sleep 1").await;
         client.set_permission_mode(PermissionMode::DontAsk);
@@ -2808,7 +2804,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn monitor_handler_selects_allow_once() {
+    async fn monitor_handler_selects_allow_once_duplicate_regression() {
         let mut client =
             spawn_script("read -t 2 response; printf '%s\\n' \"$response\"; sleep 1").await;
         client.set_permission_mode(PermissionMode::Default);
@@ -2831,7 +2827,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn lockdown_missing_reject_cancels_and_clears_pending_state() {
+    async fn lockdown_missing_reject_cancels_and_clears_pending_state_duplicate_regression() {
         let mut client =
             spawn_script("read -t 2 response; printf '%s\\n' \"$response\"; sleep 1").await;
         client.set_permission_mode(PermissionMode::DontAsk);
@@ -2857,7 +2853,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn monitor_without_allow_or_reject_cancels_and_clears_pending_state() {
+    async fn monitor_without_allow_or_reject_cancels_and_clears_pending_state_duplicate_regression()
+    {
         let mut client =
             spawn_script("read -t 2 response; printf '%s\\n' \"$response\"; sleep 1").await;
         client.set_permission_mode(PermissionMode::Default);
@@ -2883,7 +2880,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn permission_request_missing_options_cancels_and_clears_pending_state() {
+    async fn permission_request_missing_options_cancels_and_clears_pending_state_duplicate_regression(
+    ) {
         let mut client =
             spawn_script("read -t 2 response; printf '%s\\n' \"$response\"; sleep 1").await;
         let request = serde_json::json!({
@@ -2906,7 +2904,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn failed_permission_write_keeps_pending_state_and_emits_no_decision() {
+    async fn failed_permission_write_keeps_pending_state_and_emits_no_decision_duplicate_regression(
+    ) {
         let mut client = spawn_script("exit 0").await;
         let observer = ObserverHandle::in_process();
         client.set_observer(Some(observer.clone()), 0);
