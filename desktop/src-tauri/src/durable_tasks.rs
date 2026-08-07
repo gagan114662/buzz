@@ -137,6 +137,18 @@ pub struct TaskLease {
     pub expires_at: String,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HandoffRecord {
+    pub handoff_id: String,
+    pub task_id: String,
+    pub task_revision_hash: String,
+    pub from_actor: String,
+    pub to_actor: String,
+    pub next_permitted_step: String,
+    pub expires_at: String,
+    pub accepted_revision_hash: Option<String>,
+}
+
 /// Endpoint-local append-only storage. Relay state is never consulted here.
 pub struct DurableTaskStore<'a> {
     connection: &'a mut Connection,
@@ -178,6 +190,17 @@ impl<'a> DurableTaskStore<'a> {
                    holder TEXT NOT NULL,
                    generation INTEGER NOT NULL,
                    expires_at TEXT NOT NULL,
+                   FOREIGN KEY (task_id) REFERENCES guardian_durable_task_head(task_id)
+                 );
+                 CREATE TABLE IF NOT EXISTS guardian_durable_handoff (
+                   handoff_id TEXT PRIMARY KEY,
+                   task_id TEXT NOT NULL,
+                   task_revision_hash TEXT NOT NULL,
+                   from_actor TEXT NOT NULL,
+                   to_actor TEXT NOT NULL,
+                   next_permitted_step TEXT NOT NULL,
+                   expires_at TEXT NOT NULL,
+                   accepted_revision_hash TEXT,
                    FOREIGN KEY (task_id) REFERENCES guardian_durable_task_head(task_id)
                  );",
             )
@@ -545,6 +568,155 @@ impl<'a> DurableTaskStore<'a> {
             expires_at: expires_at.to_string(),
             ..lease.clone()
         })
+    }
+
+    pub fn create_handoff(
+        &mut self,
+        task_id: &str,
+        expected_revision_hash: &str,
+        to_actor: &str,
+        next_permitted_step: &str,
+        expires_at: &str,
+        now: DateTime<Utc>,
+    ) -> Result<HandoffRecord, String> {
+        validate_sha256(expected_revision_hash)?;
+        if to_actor.is_empty() || next_permitted_step.is_empty() {
+            return Err("durable handoff recipient and next step must not be empty".into());
+        }
+        if expired(expires_at, now) {
+            return Err("durable handoff expiry must be in the future".into());
+        }
+        let (task, head_hash) = self
+            .load_head(task_id)?
+            .ok_or_else(|| "durable task does not exist".to_string())?;
+        if head_hash != expected_revision_hash {
+            return Err("durable handoff task revision is stale".into());
+        }
+        if task.actor_pubkey == to_actor {
+            return Err("durable handoff recipient must differ from the current actor".into());
+        }
+        let handoff_id = uuid::Uuid::new_v4().to_string();
+        self.connection
+            .execute(
+                "INSERT INTO guardian_durable_handoff(
+                   handoff_id, task_id, task_revision_hash, from_actor, to_actor,
+                   next_permitted_step, expires_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    handoff_id,
+                    task_id,
+                    expected_revision_hash,
+                    task.actor_pubkey,
+                    to_actor,
+                    next_permitted_step,
+                    expires_at
+                ],
+            )
+            .map_err(|error| format!("failed to create durable handoff: {error}"))?;
+        Ok(HandoffRecord {
+            handoff_id,
+            task_id: task_id.to_string(),
+            task_revision_hash: expected_revision_hash.to_string(),
+            from_actor: task.actor_pubkey,
+            to_actor: to_actor.to_string(),
+            next_permitted_step: next_permitted_step.to_string(),
+            expires_at: expires_at.to_string(),
+            accepted_revision_hash: None,
+        })
+    }
+
+    /// Acceptance and task-head transfer commit atomically. The caller must
+    /// supply a new task revision whose authority explicitly names the recipient.
+    pub fn accept_handoff(
+        &mut self,
+        handoff_id: &str,
+        recipient: &str,
+        next: &DurableTaskCore,
+        now: DateTime<Utc>,
+    ) -> Result<String, String> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| format!("failed to begin durable handoff acceptance: {error}"))?;
+        let (task_id, revision_hash, from_actor, to_actor, expires_at, accepted): (
+            String,
+            String,
+            String,
+            String,
+            String,
+            Option<String>,
+        ) = transaction
+            .query_row(
+                "SELECT task_id, task_revision_hash, from_actor, to_actor, expires_at,
+                        accepted_revision_hash
+                 FROM guardian_durable_handoff WHERE handoff_id = ?1",
+                [handoff_id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
+                },
+            )
+            .map_err(|_| "durable handoff does not exist".to_string())?;
+        if accepted.is_some() {
+            return Err("durable handoff was already accepted".into());
+        }
+        if recipient != to_actor || next.actor_pubkey != to_actor || next.actor_pubkey == from_actor
+        {
+            return Err("durable handoff recipient lacks an exactly bound task revision".into());
+        }
+        if expired(&expires_at, now) {
+            return Err("durable handoff has expired".into());
+        }
+        let (head_hash, bytes): (String, Vec<u8>) = transaction
+            .query_row(
+                "SELECT h.revision_hash, r.canonical_json
+                 FROM guardian_durable_task_head h
+                 JOIN guardian_durable_task_revision r
+                   ON r.task_id = h.task_id AND r.revision = h.revision
+                 WHERE h.task_id = ?1",
+                [&task_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .map_err(|error| format!("durable handoff task head is unavailable: {error}"))?;
+        if head_hash != revision_hash || next.task_id != task_id {
+            return Err("durable handoff lost its task revision race".into());
+        }
+        let previous: DurableTaskCore = serde_json::from_slice(&bytes)
+            .map_err(|error| format!("stored durable task is corrupt: {error}"))?;
+        validate_revision(&previous, next)?;
+        if next.authority_grant_id == previous.authority_grant_id {
+            return Err("durable handoff requires a new recipient-bound authority grant".into());
+        }
+        let next_bytes = canonical_bytes(next)?;
+        let next_hash = hex::encode(Sha256::digest(&next_bytes));
+        insert_revision(&transaction, next, &next_bytes, &next_hash)?;
+        let changed = transaction
+            .execute(
+                "UPDATE guardian_durable_task_head SET revision = ?1, revision_hash = ?2
+                 WHERE task_id = ?3 AND revision_hash = ?4",
+                params![next.revision, next_hash, task_id, revision_hash],
+            )
+            .map_err(|error| format!("failed to transfer durable handoff task: {error}"))?;
+        if changed != 1 {
+            return Err("durable handoff lost its task revision race".into());
+        }
+        transaction
+            .execute(
+                "UPDATE guardian_durable_handoff SET accepted_revision_hash = ?2
+                 WHERE handoff_id = ?1 AND accepted_revision_hash IS NULL",
+                params![handoff_id, next_hash],
+            )
+            .map_err(|error| format!("failed to record durable handoff acceptance: {error}"))?;
+        transaction
+            .commit()
+            .map_err(|error| format!("failed to commit durable handoff acceptance: {error}"))?;
+        Ok(next_hash)
     }
 }
 

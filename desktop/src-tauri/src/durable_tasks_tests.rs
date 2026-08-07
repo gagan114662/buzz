@@ -195,6 +195,61 @@ fn lease_recovery_increments_generation_and_fences_stale_holder() {
         .is_ok());
 }
 
+#[test]
+fn handoff_acceptance_requires_new_recipient_grant_and_wins_once() {
+    let mut connection = Connection::open_in_memory().unwrap();
+    let mut store = DurableTaskStore::new(&mut connection).unwrap();
+    let first = task();
+    let first_hash = store.create(&first).unwrap();
+    let now = "2029-01-01T00:00:00Z".parse::<DateTime<Utc>>().unwrap();
+    let handoff = store
+        .create_handoff(
+            "task-1",
+            &first_hash,
+            "recipient",
+            "review-artifact",
+            "2029-01-01T01:00:00Z",
+            now,
+        )
+        .unwrap();
+    let losing_handoff = store
+        .create_handoff(
+            "task-1",
+            &first_hash,
+            "other-recipient",
+            "review-artifact",
+            "2029-01-01T01:00:00Z",
+            now,
+        )
+        .unwrap();
+
+    let mut next = first.clone();
+    next.revision = 2;
+    next.previous_revision_hash = Some(first_hash);
+    next.actor_pubkey = "recipient".into();
+    next.authority_grant_id = "recipient-grant".into();
+    let accepted_hash = store
+        .accept_handoff(&handoff.handoff_id, "recipient", &next, now)
+        .unwrap();
+    assert_eq!(store.load_head("task-1").unwrap().unwrap().1, accepted_hash);
+    assert!(store
+        .accept_handoff(&handoff.handoff_id, "recipient", &next, now)
+        .is_err());
+
+    let mut losing_next = next.clone();
+    losing_next.actor_pubkey = "other-recipient".into();
+    losing_next.authority_grant_id = "other-grant".into();
+    assert!(store
+        .accept_handoff(
+            &losing_handoff.handoff_id,
+            "other-recipient",
+            &losing_next,
+            now,
+        )
+        .unwrap_err()
+        .contains("revision race"));
+}
+
 fn snapshot(value: &DurableTaskCore) -> RevalidationSnapshot {
     RevalidationSnapshot {
         owner_pubkey: value.owner_pubkey.clone(),
