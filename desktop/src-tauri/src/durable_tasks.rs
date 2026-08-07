@@ -92,7 +92,8 @@ pub enum RevalidationFailure {
     WallDeadline,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum EffectState {
     Prepared,
     Pending,
@@ -121,7 +122,7 @@ impl EffectState {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct EffectRecord {
     pub effect_key: String,
     pub payload_hash: String,
@@ -129,7 +130,7 @@ pub struct EffectRecord {
     pub receipt_hash: Option<String>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct TaskLease {
     pub task_id: String,
     pub holder: String,
@@ -137,7 +138,7 @@ pub struct TaskLease {
     pub expires_at: String,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct HandoffRecord {
     pub handoff_id: String,
     pub task_id: String,
@@ -400,6 +401,27 @@ impl<'a> DurableTaskStore<'a> {
             EffectState::Pending,
             EffectState::Indeterminate,
             None,
+        )
+    }
+
+    /// Records an operator- or provider-verified receipt after a crash left an
+    /// external effect indeterminate. This is deliberately separate from
+    /// `observe_effect`: an uncertain effect must never become retryable or
+    /// successful without an explicit reconciliation step.
+    pub fn reconcile_indeterminate_effect(
+        &mut self,
+        effect_key: &str,
+        receipt: &[u8],
+    ) -> Result<EffectRecord, String> {
+        if receipt.is_empty() {
+            return Err("durable effect reconciliation requires a receipt".into());
+        }
+        let receipt_hash = hex::encode(Sha256::digest(receipt));
+        self.transition_effect(
+            effect_key,
+            EffectState::Indeterminate,
+            EffectState::Observed,
+            Some(&receipt_hash),
         )
     }
 

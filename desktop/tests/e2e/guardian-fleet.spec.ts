@@ -50,3 +50,29 @@ test("shows strong isolation as unavailable until trust is verified", async ({
     sandbox.getByRole("button", { name: "Verify and save" }),
   ).toBeDisabled();
 });
+
+test("recovers a crashed durable task without duplicating delivery", async ({
+  page,
+}) => {
+  await installMockBridge(page);
+  await page.goto("/", { waitUntil: "domcontentloaded" });
+  await openSettings(page, "agents");
+
+  const recovery = page.getByTestId("settings-guardian-durable-recovery");
+  await recovery.getByTestId("guardian-seed-durable-recovery").click();
+  await expect(recovery).toContainText("crashed effect unknown");
+  await expect(recovery).toContainText("indeterminate");
+  await expect(recovery).toContainText("Accepted with a new reviewer grant");
+
+  const next = recovery.getByTestId("guardian-durable-next-action");
+  await expect(next).toHaveText("Recover expired lease");
+  await next.click();
+  await expect(recovery).toContainText("Lease generation 2");
+  await expect(next).toHaveText("Reconcile delivery receipt");
+  await next.click();
+  await expect(recovery).toContainText("observed");
+  await expect(next).toHaveText("Complete verified delivery");
+  await next.click();
+  await expect(recovery).toContainText("complete");
+  await expect(next).toHaveCount(0);
+});

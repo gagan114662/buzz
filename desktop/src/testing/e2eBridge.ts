@@ -3016,6 +3016,7 @@ let mockGuardianCases: Array<Record<string, unknown>> = [];
 let mockGuardianSuppressions: Array<Record<string, unknown>> = [];
 let mockGuardianPolicies: Array<Record<string, unknown>> = [];
 let mockGuardianFleet: Record<string, unknown> | null = null;
+let mockGuardianDurable: Record<string, unknown> | null = null;
 
 function resetMockSaveSubscriptions(config: E2eConfig | undefined) {
   mockSaveSubscriptions = (config?.mock?.saveSubscriptions ?? []).map((s) => ({
@@ -3028,6 +3029,7 @@ function resetMockGuardianState() {
   mockGuardianSuppressions = [];
   mockGuardianPolicies = [];
   mockGuardianFleet = null;
+  mockGuardianDurable = null;
 }
 
 function resetMockPersonaCatalogEvents(config: E2eConfig | undefined) {
@@ -13213,6 +13215,104 @@ export function maybeInstallE2eTauriMocks() {
         );
       case "validate_guardian_sandbox_profile":
         throw new Error("sandbox is not configured");
+      case "seed_guardian_durable_recovery_simulation": {
+        mockGuardianDurable = {
+          task: {
+            schema_version: "guardian.durable-task/v1",
+            task_id: "synthetic-monthly-close",
+            revision: 2,
+            status: "running",
+            owner_pubkey: "a".repeat(64),
+            actor_pubkey: "b".repeat(64),
+            budget: {
+              token_limit: 100000,
+              cost_limit_microusd: 5000000,
+              consumed_tokens: 12500,
+              consumed_microusd: 420000,
+            },
+            artifact_hashes: ["c".repeat(64)],
+            unresolved_blocking_decisions: [],
+          },
+          revisionHash: "d".repeat(64),
+          effect: {
+            effect_key: "e".repeat(64),
+            payload_hash: "f".repeat(64),
+            state: "indeterminate",
+            receipt_hash: null,
+          },
+          lease: {
+            task_id: "synthetic-monthly-close",
+            holder: "synthetic-crashed-worker",
+            generation: 1,
+            expires_at: "2026-01-01T00:00:00Z",
+          },
+          handoffs: [
+            {
+              handoff_id: "synthetic-handoff",
+              from_actor: "a".repeat(64),
+              to_actor: "b".repeat(64),
+              next_permitted_step: "independently-review-close-packet",
+              accepted_revision_hash: "d".repeat(64),
+            },
+          ],
+          recoveryState: "crashed_effect_unknown",
+          synthetic: true,
+        };
+        return mockGuardianDurable;
+      }
+      case "get_guardian_durable_recovery_simulation":
+        if (!mockGuardianDurable)
+          throw new Error("Mock durable task not found");
+        return mockGuardianDurable;
+      case "recover_guardian_durable_simulation":
+        if (!mockGuardianDurable)
+          throw new Error("Mock durable task not found");
+        mockGuardianDurable = {
+          ...mockGuardianDurable,
+          task: {
+            ...(mockGuardianDurable.task as Record<string, unknown>),
+            revision: 3,
+            status: "validating",
+          },
+          lease: {
+            ...(mockGuardianDurable.lease as Record<string, unknown>),
+            holder: "synthetic-recovery-worker",
+            generation: 2,
+          },
+          recoveryState: "recovered_needs_reconciliation",
+        };
+        return mockGuardianDurable;
+      case "reconcile_guardian_durable_simulation":
+        if (!mockGuardianDurable)
+          throw new Error("Mock durable task not found");
+        mockGuardianDurable = {
+          ...mockGuardianDurable,
+          task: {
+            ...(mockGuardianDurable.task as Record<string, unknown>),
+            revision: 4,
+            status: "ready_for_delivery",
+          },
+          effect: {
+            ...(mockGuardianDurable.effect as Record<string, unknown>),
+            state: "observed",
+            receipt_hash: "9".repeat(64),
+          },
+          recoveryState: "ready_for_delivery",
+        };
+        return mockGuardianDurable;
+      case "complete_guardian_durable_simulation":
+        if (!mockGuardianDurable)
+          throw new Error("Mock durable task not found");
+        mockGuardianDurable = {
+          ...mockGuardianDurable,
+          task: {
+            ...(mockGuardianDurable.task as Record<string, unknown>),
+            revision: 5,
+            status: "complete",
+          },
+          recoveryState: "complete",
+        };
+        return mockGuardianDurable;
       case "set_prevent_sleep_active":
         return null;
       case "plugin:window|is_fullscreen":

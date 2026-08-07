@@ -92,6 +92,7 @@ import { VoiceSettingsCard } from "./VoiceSettingsCard";
 import { GuardianNumbatSettingsCard } from "./GuardianNumbatSettingsCard";
 import { GuardianFleetSettingsCard } from "./GuardianFleetSettingsCard";
 import { GuardianSandboxSettingsCard } from "./GuardianSandboxSettingsCard";
+import { GuardianDurableRecoverySettingsCard } from "./GuardianDurableRecoverySettingsCard";
 
 export type SettingsSection =
   | "profile"
@@ -882,6 +883,7 @@ export function renderSettingsSection(
           <GuardianNumbatSettingsCard />
           <GuardianFleetSettingsCard currentPubkey={props.currentPubkey} />
           <GuardianSandboxSettingsCard />
+          <GuardianDurableRecoverySettingsCard />
           <HarnessesSettingsPanel />
           <AgentDefaultsSettingsCard />
         </div>

@@ -169,6 +169,27 @@ fn indeterminate_effect_cannot_be_blindly_retried() {
 }
 
 #[test]
+fn indeterminate_effect_requires_explicit_reconciliation_receipt() {
+    let mut connection = Connection::open_in_memory().unwrap();
+    let mut store = DurableTaskStore::new(&mut connection).unwrap();
+    let prepared = store
+        .prepare_effect("task-1", "step-1", "delivery", b"payload")
+        .unwrap();
+    store.mark_effect_pending(&prepared.effect_key).unwrap();
+    store
+        .mark_effect_indeterminate(&prepared.effect_key)
+        .unwrap();
+    assert!(store
+        .reconcile_indeterminate_effect(&prepared.effect_key, b"")
+        .is_err());
+    let reconciled = store
+        .reconcile_indeterminate_effect(&prepared.effect_key, b"provider receipt")
+        .unwrap();
+    assert_eq!(reconciled.state, EffectState::Observed);
+    assert!(reconciled.receipt_hash.is_some());
+}
+
+#[test]
 fn lease_recovery_increments_generation_and_fences_stale_holder() {
     let mut connection = Connection::open_in_memory().unwrap();
     let mut store = DurableTaskStore::new(&mut connection).unwrap();
