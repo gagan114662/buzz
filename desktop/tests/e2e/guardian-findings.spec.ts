@@ -138,11 +138,9 @@ test("renders three privacy-projected Guardian alerts", async ({ page }) => {
   }
   await expect(policyWorkspace).toContainText("active");
 
-  await guardian
-    .getByTestId("guardian-import-case-input")
-    .setInputFiles({
-      name: "guardian-case-redacted.zip",
-      mimeType: "application/zip",
-      buffer: Buffer.from("mock-verified-bundle"),
-    });
+  await guardian.getByTestId("guardian-import-case-input").setInputFiles({
+    name: "guardian-case-redacted.zip",
+    mimeType: "application/zip",
+    buffer: Buffer.from("mock-verified-bundle"),
+  });
 });

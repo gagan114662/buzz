@@ -23,6 +23,8 @@ mod media_proxy;
 mod mesh_llm;
 #[cfg(not(feature = "mesh-llm"))]
 mod mesh_llm_stubs;
+#[cfg(feature = "mesh-llm")]
+mod mesh_runtime;
 mod migration;
 #[cfg(test)]
 mod model_tests;
@@ -87,30 +89,8 @@ use tray_menu::show_main_window;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    // mesh-llm's async chains overflow tokio's default 2 MiB worker stacks.
-    // Match upstream's 8 MiB stacks before anything touches tauri::async_runtime.
     #[cfg(feature = "mesh-llm")]
-    match tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .thread_stack_size(crate::mesh_llm::MESH_WORKER_STACK_SIZE)
-        .build()
-    {
-        Ok(runtime) => {
-            tauri::async_runtime::set(runtime.handle().clone());
-            // Keep the runtime alive for the process lifetime; dropping it
-            // would shut down the workers Tauri now depends on.
-            std::mem::forget(runtime);
-            eprintln!(
-                "buzz-mesh: installed tokio runtime with {} MiB worker stacks",
-                crate::mesh_llm::MESH_WORKER_STACK_SIZE / (1024 * 1024)
-            );
-        }
-        Err(error) => {
-            // Fall back to Tauri's default runtime: the app still works,
-            // only deep mesh-llm futures are at risk of stack overflow.
-            eprintln!("buzz-mesh: failed to build big-stack tokio runtime, using default: {error}");
-        }
-    }
+    mesh_runtime::install();
     let builder = tauri::Builder::default()
         .plugin(tauri_plugin_single_instance::init(|app, argv, _cwd| {
             // Focus the existing window when a duplicate instance launches.
@@ -689,9 +669,9 @@ pub fn run() {
             create_guardian_suppression,
             list_guardian_suppressions,
             cancel_guardian_suppression,
-            export_guardian_case_bundle,
-            save_guardian_case_bundle,
-            import_guardian_case_bundle,
+            commands::guardian_cases::guardian_case_bundles::export_guardian_case_bundle,
+            commands::guardian_cases::guardian_case_bundles::save_guardian_case_bundle,
+            commands::guardian_cases::guardian_case_bundles::import_guardian_case_bundle,
             create_guardian_policy_draft,
             list_guardian_policy_versions,
             simulate_guardian_policy,

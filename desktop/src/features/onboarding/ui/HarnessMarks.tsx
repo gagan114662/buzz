@@ -51,13 +51,7 @@ function OpenInterpreterMark({ className }: MarkProps) {
       viewBox="0 0 200 200"
       xmlns="http://www.w3.org/2000/svg"
     >
-      <circle
-        cx="100"
-        cy="100"
-        r="92"
-        stroke="currentColor"
-        strokeWidth="4"
-      />
+      <circle cx="100" cy="100" r="92" stroke="currentColor" strokeWidth="4" />
     </svg>
   );
 }
