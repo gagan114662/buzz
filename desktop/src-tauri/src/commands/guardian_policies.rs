@@ -424,69 +424,92 @@ pub fn transition_guardian_policy(
         true
     };
     let to_state = next_state(&policy.state, &input.action, simulation_passed)?;
-    if to_state == "active" {
-        apply_runtime_policy(&app, &state, &policy)?;
+    let runtime_rollback = if to_state == "active" {
+        Some(apply_runtime_policy(&app, &state, &policy)?)
     } else if to_state == "rolled_back" {
-        apply_runtime_policy(
+        Some(apply_runtime_policy(
             &app,
             &state,
             rollback_target.as_ref().expect("rollback target validated"),
-        )?;
+        )?)
+    } else {
+        None
+    };
+    let persist_result = (|| {
+        let now = Utc::now().to_rfc3339();
+        let previous_hash: Option<String> = transaction
+            .query_row(
+                "SELECT transition_hash FROM guardian_policy_transition ORDER BY rowid DESC LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| format!("failed to read Guardian policy audit head: {error}"))?;
+        let transition_id = uuid::Uuid::new_v4().to_string();
+        let canonical = serde_json::to_vec(&serde_json::json!({
+            "transitionId": transition_id, "policyHash": input.policy_hash,
+            "fromState": policy.state, "toState": to_state, "action": input.action,
+            "targetAgentPubkey": input.target_agent_pubkey,
+            "approvalExpiresAt": input.approval_expires_at,
+            "rollbackTargetHash": input.rollback_target_hash,
+            "createdAt": now, "previousTransitionHash": previous_hash,
+        }))
+        .map_err(|error| format!("failed to encode Guardian policy transition: {error}"))?;
+        let transition_hash = hex::encode(Sha256::digest(canonical));
+        let changed = transaction.execute(
+            "UPDATE guardian_policy_version SET state = ?2, updated_at = ?3 WHERE policy_hash = ?1 AND state = ?4",
+            params![input.policy_hash, to_state, now, policy.state],
+        ).map_err(|error| format!("failed to update Guardian policy state: {error}"))?;
+        if changed != 1 {
+            return Err("Guardian policy changed concurrently".into());
+        }
+        transaction
+            .execute(
+                "INSERT INTO guardian_policy_transition VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                params![
+                    transition_id,
+                    input.policy_hash,
+                    policy.state,
+                    to_state,
+                    input.action,
+                    now,
+                    previous_hash,
+                    transition_hash
+                ],
+            )
+            .map_err(|error| format!("failed to append Guardian policy transition: {error}"))?;
+        transaction
+            .commit()
+            .map_err(|error| format!("failed to commit Guardian policy transition: {error}"))
+    })();
+    if let Err(error) = persist_result {
+        return match runtime_rollback {
+            Some(rollback) => match restore_runtime_policy(&app, &state, rollback) {
+                Ok(()) => Err(format!(
+                    "Guardian policy transition was not committed; prior runtime configuration was restored: {error}"
+                )),
+                Err(restore_error) => Err(format!(
+                    "Guardian policy transition was not committed ({error}); prior runtime configuration could not be restored ({restore_error})"
+                )),
+            },
+            None => Err(error),
+        };
     }
-    let now = Utc::now().to_rfc3339();
-    let previous_hash: Option<String> = transaction
-        .query_row(
-            "SELECT transition_hash FROM guardian_policy_transition ORDER BY rowid DESC LIMIT 1",
-            [],
-            |row| row.get(0),
-        )
-        .optional()
-        .map_err(|error| format!("failed to read Guardian policy audit head: {error}"))?;
-    let transition_id = uuid::Uuid::new_v4().to_string();
-    let canonical = serde_json::to_vec(&serde_json::json!({
-        "transitionId": transition_id, "policyHash": input.policy_hash,
-        "fromState": policy.state, "toState": to_state, "action": input.action,
-        "targetAgentPubkey": input.target_agent_pubkey,
-        "approvalExpiresAt": input.approval_expires_at,
-        "rollbackTargetHash": input.rollback_target_hash,
-        "createdAt": now, "previousTransitionHash": previous_hash,
-    }))
-    .map_err(|error| format!("failed to encode Guardian policy transition: {error}"))?;
-    let transition_hash = hex::encode(Sha256::digest(canonical));
-    let changed = transaction.execute(
-        "UPDATE guardian_policy_version SET state = ?2, updated_at = ?3 WHERE policy_hash = ?1 AND state = ?4",
-        params![input.policy_hash, to_state, now, policy.state],
-    ).map_err(|error| format!("failed to update Guardian policy state: {error}"))?;
-    if changed != 1 {
-        return Err("Guardian policy changed concurrently".into());
-    }
-    transaction
-        .execute(
-            "INSERT INTO guardian_policy_transition VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-            params![
-                transition_id,
-                input.policy_hash,
-                policy.state,
-                to_state,
-                input.action,
-                now,
-                previous_hash,
-                transition_hash
-            ],
-        )
-        .map_err(|error| format!("failed to append Guardian policy transition: {error}"))?;
-    transaction
-        .commit()
-        .map_err(|error| format!("failed to commit Guardian policy transition: {error}"))?;
     let connection = open_store(&app)?;
     read_policy(&connection, &input.policy_hash)
+}
+
+struct RuntimePolicyRollback {
+    agent_pubkey: String,
+    previous_env: std::collections::BTreeMap<String, String>,
+    relay_url: String,
 }
 
 fn apply_runtime_policy(
     app: &AppHandle,
     state: &AppState,
     policy: &GuardianPolicyVersion,
-) -> Result<(), String> {
+) -> Result<RuntimePolicyRollback, String> {
     let env_value = match policy.mode.as_str() {
         "monitor" => "default",
         "deny" => "dont-ask",
@@ -539,7 +562,33 @@ fn apply_runtime_policy(
             )),
         };
     }
-    Ok(())
+    Ok(RuntimePolicyRollback {
+        agent_pubkey: policy.agent_pubkey.clone(),
+        previous_env,
+        relay_url,
+    })
+}
+
+fn restore_runtime_policy(
+    app: &AppHandle,
+    state: &AppState,
+    rollback: RuntimePolicyRollback,
+) -> Result<(), String> {
+    {
+        let _guard = state
+            .managed_agents_store_lock
+            .lock()
+            .map_err(|_| "managed-agent storage lock poisoned".to_string())?;
+        let mut records = load_managed_agents(app)?;
+        let record = records
+            .iter_mut()
+            .find(|record| record.pubkey.eq_ignore_ascii_case(&rollback.agent_pubkey))
+            .ok_or_else(|| "policy target disappeared during transition rollback".to_string())?;
+        record.env_vars = rollback.previous_env;
+        save_managed_agents(app, &records)?;
+    }
+    restart_managed_agent_runtime(rollback.agent_pubkey, rollback.relay_url, app.clone())
+        .map(|_| ())
 }
 
 #[cfg(test)]
