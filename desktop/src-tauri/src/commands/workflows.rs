@@ -59,6 +59,20 @@ pub struct TriggerWorkflowWire {
     pub status: String,
 }
 
+/// Response returned after the relay accepts an approval decision.
+/// Mirrors `RawApprovalActionResponse` in the frontend.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct ApprovalActionWire {
+    /// Hashed approval token used by the lifecycle command.
+    pub token: String,
+    /// Decision accepted by the relay (`granted` or `denied`).
+    pub status: String,
+    /// Workflow run affected by the decision.
+    pub run_id: String,
+    /// Workflow definition that owns the affected run.
+    pub workflow_id: String,
+}
+
 // ── Reads ────────────────────────────────────────────────────────────────────
 
 #[tauri::command]
@@ -287,7 +301,9 @@ pub async fn grant_approval(
 ) -> Result<Value, String> {
     let builder = events::build_approval_grant(&token, note.as_deref())?;
     let result = submit_event(builder, &state).await?;
-    Ok(serde_json::json!({ "event_id": result.event_id }))
+    let response = approval_action_response(&token, "granted", &result.message)?;
+    serde_json::to_value(response)
+        .map_err(|e| format!("approval response serialization failed: {e}"))
 }
 
 #[tauri::command]
@@ -298,7 +314,9 @@ pub async fn deny_approval(
 ) -> Result<Value, String> {
     let builder = events::build_approval_deny(&token, note.as_deref())?;
     let result = submit_event(builder, &state).await?;
-    Ok(serde_json::json!({ "event_id": result.event_id }))
+    let response = approval_action_response(&token, "denied", &result.message)?;
+    serde_json::to_value(response)
+        .map_err(|e| format!("approval response serialization failed: {e}"))
 }
 
 // ── Helpers (pure, unit-tested in workflows_tests.rs) ─────────────────────────
@@ -334,6 +352,43 @@ fn trigger_workflow_response(
         // The relay acknowledges immediately after creating the durable run;
         // execution continues asynchronously from its initial pending state.
         status: "pending".to_string(),
+    })
+}
+
+fn approval_action_response(
+    requested_token: &str,
+    expected_status: &str,
+    relay_message: &str,
+) -> Result<ApprovalActionWire, String> {
+    let payload = parse_command_response::<Value>(relay_message)?;
+    let field = |name: &str| {
+        payload
+            .get(name)
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| format!("approval response missing {name}"))
+    };
+
+    let token = field("token")?;
+    if token != requested_token {
+        return Err("approval response token does not match request".to_string());
+    }
+    let status = field("status")?;
+    if status != expected_status {
+        return Err("approval response status does not match request".to_string());
+    }
+    let run_id = field("run_id")?;
+    let workflow_id = field("workflow_id")?;
+    uuid::Uuid::parse_str(run_id)
+        .map_err(|_| "approval response has invalid run_id".to_string())?;
+    uuid::Uuid::parse_str(workflow_id)
+        .map_err(|_| "approval response has invalid workflow_id".to_string())?;
+
+    Ok(ApprovalActionWire {
+        token: token.to_string(),
+        status: status.to_string(),
+        run_id: run_id.to_string(),
+        workflow_id: workflow_id.to_string(),
     })
 }
 

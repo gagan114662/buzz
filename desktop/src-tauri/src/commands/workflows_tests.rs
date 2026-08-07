@@ -218,6 +218,45 @@ fn trigger_response_rejects_missing_or_invalid_run_ids() {
 }
 
 #[test]
+fn approval_response_preserves_the_complete_frontend_contract() {
+    let token = "ab".repeat(32);
+    let run_id = "33333333-3333-3333-3333-333333333333";
+    let response = approval_action_response(
+        &token,
+        "granted",
+        &format!(
+            r#"response:{{"token":"{token}","status":"granted","run_id":"{run_id}","workflow_id":"{WF}"}}"#
+        ),
+    )
+    .expect("parse approval response");
+
+    assert_eq!(response.token, token);
+    assert_eq!(response.status, "granted");
+    assert_eq!(response.run_id, run_id);
+    assert_eq!(response.workflow_id, WF);
+}
+
+#[test]
+fn approval_response_rejects_mismatched_decisions_and_tokens() {
+    let token = "ab".repeat(32);
+    let other_token = "cd".repeat(32);
+    let payload = |response_token: &str, status: &str| {
+        format!(
+            r#"response:{{"token":"{response_token}","status":"{status}","run_id":"33333333-3333-3333-3333-333333333333","workflow_id":"{WF}"}}"#
+        )
+    };
+
+    assert_eq!(
+        approval_action_response(&token, "granted", &payload(&other_token, "granted")).unwrap_err(),
+        "approval response token does not match request"
+    );
+    assert_eq!(
+        approval_action_response(&token, "granted", &payload(&token, "denied")).unwrap_err(),
+        "approval response status does not match request"
+    );
+}
+
+#[test]
 fn runs_and_approvals_serialize_to_bare_empty_array() {
     // Regression guard for the crash class this fix closed. The frontend
     // wrappers `getWorkflowRuns` / `getRunApprovals` do `raw.map(...)`, so the

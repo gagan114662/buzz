@@ -1128,13 +1128,7 @@ async fn handle_approval_grant(
     Ok(IngestResult {
         event_id: event.id.to_hex(),
         accepted: true,
-        message: format!(
-            "response:{}",
-            serde_json::json!({
-                "status": "granted",
-                "run_id": run_id.to_string(),
-            })
-        ),
+        message: approval_action_message(&token_hash_hex, "granted", run_id, workflow_id),
     })
 }
 
@@ -1225,6 +1219,7 @@ async fn handle_approval_deny(
     // 6. Cancel the workflow run (post-commit, async)
     let community_id = tenant.community();
     let run_id = approval.run_id;
+    let workflow_id = approval.workflow_id;
     let pubkey_hex = self_hex.clone();
     let db = state.db.clone();
 
@@ -1265,14 +1260,20 @@ async fn handle_approval_deny(
     Ok(IngestResult {
         event_id: event.id.to_hex(),
         accepted: true,
-        message: format!(
-            "response:{}",
-            serde_json::json!({
-                "status": "denied",
-                "run_id": run_id.to_string(),
-            })
-        ),
+        message: approval_action_message(&token_hash_hex, "denied", run_id, workflow_id),
     })
+}
+
+fn approval_action_message(token: &str, status: &str, run_id: Uuid, workflow_id: Uuid) -> String {
+    format!(
+        "response:{}",
+        serde_json::json!({
+            "token": token,
+            "status": status,
+            "run_id": run_id.to_string(),
+            "workflow_id": workflow_id.to_string(),
+        })
+    )
 }
 
 /// Resume a suspended workflow run after an approval gate has been granted.
@@ -1367,4 +1368,24 @@ async fn resume_workflow_after_approval(
     engine
         .finalize_run(community_id, run_id, result, existing_trace)
         .await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn approval_action_message_carries_the_complete_desktop_contract() {
+        let run_id = Uuid::parse_str("33333333-3333-3333-3333-333333333333").unwrap();
+        let workflow_id = Uuid::parse_str("22222222-2222-2222-2222-222222222222").unwrap();
+        let message = approval_action_message("abcd", "granted", run_id, workflow_id);
+        let payload: serde_json::Value =
+            serde_json::from_str(message.strip_prefix("response:").expect("response prefix"))
+                .expect("response JSON");
+
+        assert_eq!(payload["token"], "abcd");
+        assert_eq!(payload["status"], "granted");
+        assert_eq!(payload["run_id"], run_id.to_string());
+        assert_eq!(payload["workflow_id"], workflow_id.to_string());
+    }
 }
