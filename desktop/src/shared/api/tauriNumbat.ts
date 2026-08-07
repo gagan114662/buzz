@@ -55,6 +55,14 @@ export type GuardianSuppression = {
   status: "active" | "expired" | "cancelled";
 };
 
+export type GuardianCaseImportPreview = {
+  schemaVersion: string;
+  profile: "redacted" | "regression";
+  caseId: string;
+  fileCount: number;
+  verified: boolean;
+};
+
 export function getGuardianNumbatStatus(): Promise<GuardianNumbatStatus> {
   return invokeTauri<GuardianNumbatStatus>("get_guardian_numbat_status");
 }
@@ -168,5 +176,13 @@ export function saveGuardianCaseBundle(
 ): Promise<boolean> {
   return invokeTauri<boolean>("save_guardian_case_bundle", {
     input: { caseId, profile },
+  });
+}
+
+export function importGuardianCaseBundle(
+  bytes: number[],
+): Promise<GuardianCaseImportPreview> {
+  return invokeTauri<GuardianCaseImportPreview>("import_guardian_case_bundle", {
+    input: { bytes },
   });
 }

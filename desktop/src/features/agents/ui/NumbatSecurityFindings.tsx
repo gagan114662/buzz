@@ -7,6 +7,7 @@ import {
   cancelGuardianSuppression,
   createGuardianCase,
   createGuardianSuppression,
+  importGuardianCaseBundle,
   listGuardianCases,
   listGuardianSuppressions,
   saveGuardianCaseBundle,
@@ -57,6 +58,7 @@ export function NumbatSecurityFindings({
     null,
   );
   const [suppressionReason, setSuppressionReason] = React.useState("");
+  const bundleImportRef = React.useRef<HTMLInputElement>(null);
 
   const refreshCases = React.useCallback(() => {
     void listGuardianCases(agentPubkey)
@@ -87,6 +89,48 @@ export function NumbatSecurityFindings({
         </div>
       ) : null}
       <GuardianPolicyWorkspace agentPubkey={agentPubkey} />
+      <div className="flex items-center gap-2">
+        <Button
+          data-testid="guardian-import-case-bundle"
+          onClick={() => bundleImportRef.current?.click()}
+          size="xs"
+          type="button"
+          variant="outline"
+        >
+          Verify imported case bundle
+        </Button>
+        <input
+          accept=".zip,application/zip"
+          className="hidden"
+          data-testid="guardian-import-case-input"
+          onChange={(event) => {
+            const file = event.target.files?.[0];
+            if (!file) return;
+            void file
+              .arrayBuffer()
+              .then((buffer) =>
+                importGuardianCaseBundle(Array.from(new Uint8Array(buffer))),
+              )
+              .then((preview) => {
+                if (preview.verified) {
+                  toast.success(
+                    `Verified ${preview.profile} bundle for case ${preview.caseId}`,
+                  );
+                }
+              })
+              .catch((cause: unknown) =>
+                toast.error(
+                  cause instanceof Error
+                    ? cause.message
+                    : "Could not verify case bundle",
+                ),
+              );
+            event.target.value = "";
+          }}
+          ref={bundleImportRef}
+          type="file"
+        />
+      </div>
       {cases.length > 0 ? (
         <div className="space-y-2" data-testid="guardian-case-list">
           <p
