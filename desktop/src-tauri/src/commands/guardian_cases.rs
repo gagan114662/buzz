@@ -61,6 +61,7 @@ pub struct CreateGuardianSuppressionInput {
     finding_id: String,
     reason: String,
     expires_at: String,
+    replaces_suppression_id: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -665,18 +666,64 @@ pub fn create_guardian_suppression(
             [now.to_rfc3339()],
         )
         .map_err(|error| format!("failed to expire Guardian suppressions: {error}"))?;
-    if transaction
+    let active_suppression: Option<String> = transaction
         .query_row(
-            "SELECT 1 FROM guardian_suppression
+            "SELECT suppression_id FROM guardian_suppression
              WHERE finding_id = ?1 AND status = 'active' LIMIT 1",
             [&input.finding_id],
-            |_| Ok(()),
+            |row| row.get(0),
         )
         .optional()
-        .map_err(|error| format!("failed to inspect Guardian suppressions: {error}"))?
-        .is_some()
-    {
-        return Err("this finding already has an active suppression".into());
+        .map_err(|error| format!("failed to inspect Guardian suppressions: {error}"))?;
+    match (
+        active_suppression.as_deref(),
+        input.replaces_suppression_id.as_deref(),
+    ) {
+        (Some(active), Some(replaces)) if active == replaces => {}
+        (Some(_), _) => return Err("this finding already has an active suppression".into()),
+        (None, Some(_)) => return Err("the suppression being renewed is no longer active".into()),
+        (None, None) => {}
+    }
+    let previous: Option<(String, i64, String, String, String, String)> = transaction
+        .query_row(
+            "SELECT suppression_id, version, reason, starts_at, expires_at, status
+             FROM guardian_suppression
+             WHERE finding_id = ?1 AND agent_pubkey = ?2
+             ORDER BY rowid DESC LIMIT 1",
+            params![input.finding_id, input.agent_pubkey],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(|error| format!("failed to inspect prior Guardian suppression: {error}"))?;
+    let (version, previous_version_hash) = match previous {
+        Some((id, version, prior_reason, prior_start, prior_expiry, prior_status)) => {
+            let canonical = serde_json::to_vec(&serde_json::json!({
+                "suppressionId": id, "version": version, "findingId": input.finding_id,
+                "reason": prior_reason, "startsAt": prior_start,
+                "expiresAt": prior_expiry, "status": prior_status,
+            }))
+            .map_err(|error| format!("failed to encode prior Guardian suppression: {error}"))?;
+            (version + 1, Some(hex::encode(Sha256::digest(canonical))))
+        }
+        None => (1, None),
+    };
+    if active_suppression.is_some() {
+        transaction
+            .execute(
+                "UPDATE guardian_suppression SET status = 'superseded'
+             WHERE suppression_id = ?1 AND status = 'active'",
+                [active_suppression.as_deref().unwrap_or_default()],
+            )
+            .map_err(|error| format!("failed to supersede Guardian suppression: {error}"))?;
     }
     let actor = owner_pubkey(&app)?;
     let suppression_id = uuid::Uuid::new_v4().to_string();
@@ -686,16 +733,18 @@ pub fn create_guardian_suppression(
         .execute(
             "INSERT INTO guardian_suppression(
                suppression_id, schema_version, version, agent_pubkey, finding_id,
-               reason, created_by, starts_at, expires_at, status
-             ) VALUES (?1, 'guardian.suppression/v1', 1, ?2, ?3, ?4, ?5, ?6, ?7, 'active')",
+               reason, created_by, starts_at, expires_at, status, previous_version_hash
+             ) VALUES (?1, 'guardian.suppression/v1', ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'active', ?9)",
             params![
                 suppression_id,
+                version,
                 input.agent_pubkey,
                 input.finding_id,
                 reason,
                 actor,
                 starts_at,
                 expires_at,
+                previous_version_hash,
             ],
         )
         .map_err(|error| format!("failed to create Guardian suppression: {error}"))?;

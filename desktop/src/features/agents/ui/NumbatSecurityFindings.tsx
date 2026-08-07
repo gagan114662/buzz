@@ -426,40 +426,89 @@ export function NumbatSecurityFindings({
                         : "Acknowledge"}
                     </Button>
                     {activeSuppression ? (
-                      <Button
-                        data-testid="guardian-cancel-suppression"
-                        disabled={pendingFinding === finding.findingId}
-                        onClick={() => {
-                          setPendingFinding(finding.findingId);
-                          void cancelGuardianSuppression(
-                            activeSuppression.suppressionId,
-                            "Owner restored alert notifications",
-                          )
-                            .then((cancelled) => {
-                              setSuppressions((current) =>
-                                current.map((item) =>
-                                  item.suppressionId === cancelled.suppressionId
-                                    ? cancelled
-                                    : item,
-                                ),
-                              );
-                              toast.success("Alert suppression cancelled");
-                            })
-                            .catch((cause: unknown) =>
-                              toast.error(
-                                cause instanceof Error
-                                  ? cause.message
-                                  : "Could not cancel suppression",
-                              ),
+                      <>
+                        <Button
+                          data-testid="guardian-renew-suppression"
+                          disabled={pendingFinding === finding.findingId}
+                          onClick={() => {
+                            setPendingFinding(finding.findingId);
+                            void createGuardianSuppression(
+                              agentPubkey,
+                              finding.findingId,
+                              activeSuppression.reason,
+                              new Date(
+                                Date.now() + 24 * 60 * 60 * 1000,
+                              ).toISOString(),
+                              activeSuppression.suppressionId,
                             )
-                            .finally(() => setPendingFinding(null));
-                        }}
-                        size="xs"
-                        type="button"
-                        variant="outline"
-                      >
-                        Restore alerts
-                      </Button>
+                              .then((renewed) => {
+                                setSuppressions((current) => [
+                                  renewed,
+                                  ...current.map((item) =>
+                                    item.suppressionId ===
+                                    activeSuppression.suppressionId
+                                      ? {
+                                          ...item,
+                                          status: "superseded" as const,
+                                        }
+                                      : item,
+                                  ),
+                                ]);
+                                toast.success(
+                                  "Suppression renewed for 24 hours",
+                                );
+                              })
+                              .catch((cause: unknown) =>
+                                toast.error(
+                                  cause instanceof Error
+                                    ? cause.message
+                                    : "Could not renew suppression",
+                                ),
+                              )
+                              .finally(() => setPendingFinding(null));
+                          }}
+                          size="xs"
+                          type="button"
+                          variant="outline"
+                        >
+                          Renew 24h
+                        </Button>
+                        <Button
+                          data-testid="guardian-cancel-suppression"
+                          disabled={pendingFinding === finding.findingId}
+                          onClick={() => {
+                            setPendingFinding(finding.findingId);
+                            void cancelGuardianSuppression(
+                              activeSuppression.suppressionId,
+                              "Owner restored alert notifications",
+                            )
+                              .then((cancelled) => {
+                                setSuppressions((current) =>
+                                  current.map((item) =>
+                                    item.suppressionId ===
+                                    cancelled.suppressionId
+                                      ? cancelled
+                                      : item,
+                                  ),
+                                );
+                                toast.success("Alert suppression cancelled");
+                              })
+                              .catch((cause: unknown) =>
+                                toast.error(
+                                  cause instanceof Error
+                                    ? cause.message
+                                    : "Could not cancel suppression",
+                                ),
+                              )
+                              .finally(() => setPendingFinding(null));
+                          }}
+                          size="xs"
+                          type="button"
+                          variant="outline"
+                        >
+                          Restore alerts
+                        </Button>
+                      </>
                     ) : null}
                     <Button
                       data-testid="guardian-create-case"

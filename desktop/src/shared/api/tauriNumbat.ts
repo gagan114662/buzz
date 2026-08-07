@@ -52,7 +52,7 @@ export type GuardianSuppression = {
   reason: string;
   startsAt: string;
   expiresAt: string;
-  status: "active" | "expired" | "cancelled";
+  status: "active" | "expired" | "cancelled" | "superseded";
 };
 
 export type GuardianCaseImportPreview = {
@@ -147,9 +147,16 @@ export function createGuardianSuppression(
   findingId: string,
   reason: string,
   expiresAt: string,
+  replacesSuppressionId?: string,
 ): Promise<GuardianSuppression> {
   return invokeTauri<GuardianSuppression>("create_guardian_suppression", {
-    input: { agentPubkey, findingId, reason, expiresAt },
+    input: {
+      agentPubkey,
+      findingId,
+      reason,
+      expiresAt,
+      replacesSuppressionId,
+    },
   });
 }
 
