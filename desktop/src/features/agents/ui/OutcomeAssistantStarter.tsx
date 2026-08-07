@@ -50,7 +50,7 @@ export function buildOutcomeAssistantInitialValues(
   return {
     displayName: preset.name,
     avatarUrl: "",
-    systemPrompt: `${preset.routine}\n\nCurrent outcome: ${outcome.trim()}\n\nAuthorized access requested by the owner: ${selectedAccess.join(", ")}. Treat all other access as unavailable and request approval before expanding scope.\n\nFinish with one completion packet containing: completed work, blockers, evidence, approvals used, and unresolved decisions. Never describe work as complete unless the evidence proves it.`,
+    systemPrompt: `${preset.routine}\n\nCurrent outcome: ${outcome.trim()}\n\nAuthorized access requested by the owner: ${selectedAccess.join(", ")}. Treat all other access as unavailable and request approval before expanding scope.\n\nFinish with a fenced \`\`\`buzz-completion-packet JSON object containing exactly five string-array fields: completed, blockers, evidence, approvals, and unresolvedDecisions. Never describe work as complete unless the evidence proves it.`,
   };
 }
 

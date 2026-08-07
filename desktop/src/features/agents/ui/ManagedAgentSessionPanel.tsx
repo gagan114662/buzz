@@ -38,6 +38,10 @@ import {
   useArchivedChannelEvents,
 } from "./useObserverEvents";
 import { buildTranscriptState } from "./agentSessionTranscript";
+import {
+  CompletionPacketCard,
+  latestCompletionPacket,
+} from "./CompletionPacketCard";
 
 type ManagedAgentSessionPanelProps = {
   agent: Pick<ManagedAgent, "pubkey" | "name" | "status"> & {
@@ -117,6 +121,10 @@ export function ManagedAgentSessionPanel({
     [combinedEvents],
   );
   const displayTranscript = transcriptOverride ?? derivedTranscript;
+  const completionPacket = React.useMemo(
+    () => latestCompletionPacket(displayTranscript),
+    [displayTranscript],
+  );
 
   const displayEvents = React.useMemo(
     () => resolveDisplayEvents(combinedEvents, rawEventsOverride),
@@ -165,6 +173,7 @@ export function ManagedAgentSessionPanel({
         transcript={displayTranscript}
         transcriptContentClassName={transcriptContentClassName}
         transcriptVariant={transcriptVariant}
+        completionPacket={completionPacket}
       />
     </section>
   );
@@ -224,6 +233,7 @@ function SessionBody({
   transcript,
   transcriptContentClassName,
   transcriptVariant,
+  completionPacket,
 }: {
   agentAvatarUrl: string | null;
   agentName: string;
@@ -243,6 +253,7 @@ function SessionBody({
   transcript: TranscriptItem[];
   transcriptContentClassName?: string;
   transcriptVariant: AgentSessionTranscriptVariant;
+  completionPacket: import("./CompletionPacketCard").CompletionPacket | null;
 }) {
   const rawRail = resolveRawRailLayout(showRaw, rawLayout);
 
@@ -273,30 +284,35 @@ function SessionBody({
         !hasTranscriptOverride ? (
         <SessionLoadingSkeleton />
       ) : (
-        <div
-          className={cn(
-            rawRail.mode === "side"
-              ? "mt-4 grid gap-4 xl:grid-cols-[minmax(0,1fr)_20rem]"
-              : "mt-0",
-            autoTail && "min-h-0 flex-1 overflow-hidden",
-          )}
-        >
-          <AgentSessionTranscriptList
-            agentAvatarUrl={agentAvatarUrl}
-            agentName={agentName}
-            agentPubkey={agentPubkey}
-            channelId={channelId}
-            emptyDescription={emptyDescription}
-            emptyState={emptyState}
-            items={transcript}
-            profiles={profiles}
-            contentContainerClassName={transcriptContentClassName}
-            scrollScopeKey={`${agentPubkey}:${channelId ?? "all"}`}
-            autoTail={autoTail}
-            variant={transcriptVariant}
-          />
-          {rawRail.mode === "side" ? <RawEventRail events={events} /> : null}
-        </div>
+        <>
+          {completionPacket ? (
+            <CompletionPacketCard packet={completionPacket} />
+          ) : null}
+          <div
+            className={cn(
+              rawRail.mode === "side"
+                ? "mt-4 grid gap-4 xl:grid-cols-[minmax(0,1fr)_20rem]"
+                : "mt-0",
+              autoTail && "min-h-0 flex-1 overflow-hidden",
+            )}
+          >
+            <AgentSessionTranscriptList
+              agentAvatarUrl={agentAvatarUrl}
+              agentName={agentName}
+              agentPubkey={agentPubkey}
+              channelId={channelId}
+              emptyDescription={emptyDescription}
+              emptyState={emptyState}
+              items={transcript}
+              profiles={profiles}
+              contentContainerClassName={transcriptContentClassName}
+              scrollScopeKey={`${agentPubkey}:${channelId ?? "all"}`}
+              autoTail={autoTail}
+              variant={transcriptVariant}
+            />
+            {rawRail.mode === "side" ? <RawEventRail events={events} /> : null}
+          </div>
+        </>
       )}
 
       {errorMessage ? (
