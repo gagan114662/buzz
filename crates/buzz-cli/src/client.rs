@@ -270,17 +270,29 @@ fn is_safe_media_ext(value: &str) -> bool {
 
 fn media_url_from_input(relay_url: &str, input: &str) -> Result<String, CliError> {
     let input = input.trim();
+    let relay = url::Url::parse(relay_url)
+        .map_err(|e| CliError::Usage(format!("invalid relay URL: {e}")))?;
+    let media_path_prefix = format!("{}/media/", relay.path().trim_end_matches('/'));
     if input.starts_with("http://") || input.starts_with("https://") {
         let parsed = url::Url::parse(input)
             .map_err(|e| CliError::Usage(format!("invalid media URL: {e}")))?;
-        if !parsed.path().starts_with("/media/") {
+        if !parsed.username().is_empty()
+            || parsed.password().is_some()
+            || parsed.query().is_some()
+            || parsed.fragment().is_some()
+        {
             return Err(CliError::Usage(
-                "media URL must point at a /media/ path".to_string(),
+                "media URL must not contain credentials, a query, or a fragment".to_string(),
             ));
         }
-        let Some(sha256_ext) = parsed.path().strip_prefix("/media/") else {
+        if !parsed.path().starts_with(&media_path_prefix) {
             return Err(CliError::Usage(
-                "media URL must point at a /media/ path".to_string(),
+                "media URL must point at the relay's media path".to_string(),
+            ));
+        }
+        let Some(sha256_ext) = parsed.path().strip_prefix(&media_path_prefix) else {
+            return Err(CliError::Usage(
+                "media URL must point at the relay's media path".to_string(),
             ));
         };
         if !is_safe_media_path_segment(sha256_ext) {
@@ -288,8 +300,6 @@ fn media_url_from_input(relay_url: &str, input: &str) -> Result<String, CliError
                 "media path must be sha256, sha256.ext, or sha256.thumb.jpg".to_string(),
             ));
         }
-        let relay = url::Url::parse(relay_url)
-            .map_err(|e| CliError::Usage(format!("invalid relay URL: {e}")))?;
         if parsed.scheme() != relay.scheme()
             || parsed.host_str() != relay.host_str()
             || parsed.port_or_known_default() != relay.port_or_known_default()
@@ -321,6 +331,61 @@ fn media_url_from_input(relay_url: &str, input: &str) -> Result<String, CliError
         "{}/media/{sha256_ext}",
         relay_url.trim_end_matches('/')
     ))
+}
+
+fn validate_blob_descriptor(
+    descriptor: BlobDescriptor,
+    relay_url: &str,
+    expected_sha256: &str,
+    expected_size: u64,
+    expected_mime: &str,
+) -> Result<BlobDescriptor, CliError> {
+    if descriptor.sha256 != expected_sha256 {
+        return Err(CliError::Other(
+            "upload response hash does not match uploaded bytes".to_string(),
+        ));
+    }
+    if descriptor.size != expected_size {
+        return Err(CliError::Other(
+            "upload response size does not match uploaded bytes".to_string(),
+        ));
+    }
+    if descriptor.mime_type != expected_mime {
+        return Err(CliError::Other(
+            "upload response media type does not match uploaded bytes".to_string(),
+        ));
+    }
+
+    let canonical_url = media_url_from_input(relay_url, &descriptor.url)
+        .map_err(|e| CliError::Other(format!("invalid upload response URL: {e}")))?;
+    let parsed = url::Url::parse(&canonical_url)
+        .map_err(|e| CliError::Other(format!("invalid upload response URL: {e}")))?;
+    let path_hash = parsed
+        .path()
+        .rsplit('/')
+        .next()
+        .and_then(|segment| segment.split('.').next())
+        .unwrap_or_default();
+    if path_hash != expected_sha256 {
+        return Err(CliError::Other(
+            "upload response URL does not identify the uploaded bytes".to_string(),
+        ));
+    }
+
+    if let Some(ref thumb) = descriptor.thumb {
+        let canonical_thumb = media_url_from_input(relay_url, thumb)
+            .map_err(|e| CliError::Other(format!("invalid upload thumbnail URL: {e}")))?;
+        let parsed_thumb = url::Url::parse(&canonical_thumb)
+            .map_err(|e| CliError::Other(format!("invalid upload thumbnail URL: {e}")))?;
+        let expected_thumb_name = format!("{expected_sha256}.thumb.jpg");
+        if parsed_thumb.path().rsplit('/').next() != Some(expected_thumb_name.as_str()) {
+            return Err(CliError::Other(
+                "upload thumbnail URL does not identify the uploaded bytes".to_string(),
+            ));
+        }
+    }
+
+    Ok(descriptor)
 }
 
 fn sign_blossom_get(keys: &Keys, media_url: &str) -> Result<String, CliError> {
@@ -400,6 +465,14 @@ mod media_download_tests {
             media_url_from_input("https://relay.example/", &format!("/media/{hash}.jpg")).unwrap(),
             format!("https://relay.example/media/{hash}.jpg")
         );
+        assert_eq!(
+            media_url_from_input(
+                "https://relay.example/community",
+                &format!("https://relay.example/community/media/{hash}.jpg")
+            )
+            .unwrap(),
+            format!("https://relay.example/community/media/{hash}.jpg")
+        );
     }
 
     #[test]
@@ -448,6 +521,76 @@ mod media_download_tests {
                 "input should be rejected: {input}"
             );
         }
+
+        let hash = "a".repeat(64);
+        for input in [
+            format!("https://user@relay.example/media/{hash}.jpg"),
+            format!("https://relay.example/media/{hash}.jpg?download=1"),
+            format!("https://relay.example/media/{hash}.jpg#fragment"),
+        ] {
+            assert!(
+                media_url_from_input("https://relay.example", &input).is_err(),
+                "ambiguous media URL should be rejected: {input}"
+            );
+        }
+    }
+
+    #[test]
+    fn upload_descriptor_is_bound_to_uploaded_bytes_and_relay() {
+        let hash = "a".repeat(64);
+        let descriptor = || BlobDescriptor {
+            url: format!("https://relay.example/media/{hash}.jpg"),
+            sha256: hash.clone(),
+            size: 12,
+            mime_type: "image/jpeg".to_string(),
+            uploaded: 0,
+            dim: None,
+            blurhash: None,
+            thumb: Some(format!("https://relay.example/media/{hash}.thumb.jpg")),
+            duration: None,
+        };
+
+        assert!(validate_blob_descriptor(
+            descriptor(),
+            "https://relay.example",
+            &hash,
+            12,
+            "image/jpeg"
+        )
+        .is_ok());
+
+        let mut wrong_hash = descriptor();
+        wrong_hash.sha256 = "b".repeat(64);
+        assert!(validate_blob_descriptor(
+            wrong_hash,
+            "https://relay.example",
+            &hash,
+            12,
+            "image/jpeg"
+        )
+        .is_err());
+
+        let mut wrong_origin = descriptor();
+        wrong_origin.url = format!("https://evil.example/media/{hash}.jpg");
+        assert!(validate_blob_descriptor(
+            wrong_origin,
+            "https://relay.example",
+            &hash,
+            12,
+            "image/jpeg"
+        )
+        .is_err());
+
+        let mut wrong_size = descriptor();
+        wrong_size.size = 13;
+        assert!(validate_blob_descriptor(
+            wrong_size,
+            "https://relay.example",
+            &hash,
+            12,
+            "image/jpeg"
+        )
+        .is_err());
     }
 
     #[test]
@@ -1228,7 +1371,7 @@ impl BuzzClient {
                                 .header("Authorization", auth_header)
                                 .header("Content-Type", &mime)
                                 .header("X-SHA-256", &sha256)
-                                .body(upload_body),
+                                .body(upload_body.clone()),
                         )
                         .send()
                         .await?;
@@ -1238,7 +1381,17 @@ impl BuzzClient {
                         let body = resp.text().await.unwrap_or_default();
                         return Err(CliError::Relay { status: s, body });
                     }
-                    resp.json::<BlobDescriptor>().await.map_err(CliError::from)
+                    let descriptor = resp
+                        .json::<BlobDescriptor>()
+                        .await
+                        .map_err(CliError::from)?;
+                    validate_blob_descriptor(
+                        descriptor,
+                        &self.relay_url,
+                        &sha256,
+                        upload_body.len() as u64,
+                        &mime,
+                    )
                 }
             })
             .await;
@@ -1274,7 +1427,7 @@ impl BuzzClient {
                             .header("Authorization", auth_header)
                             .header("Content-Type", &mime)
                             .header("X-SHA-256", &sha256)
-                            .body(upload_body),
+                            .body(upload_body.clone()),
                     )
                     .send()
                     .await?;
@@ -1283,7 +1436,17 @@ impl BuzzClient {
                     let body = resp.text().await.unwrap_or_default();
                     return Err(CliError::Relay { status, body });
                 }
-                resp.json::<BlobDescriptor>().await.map_err(CliError::from)
+                let descriptor = resp
+                    .json::<BlobDescriptor>()
+                    .await
+                    .map_err(CliError::from)?;
+                validate_blob_descriptor(
+                    descriptor,
+                    &self.relay_url,
+                    &sha256,
+                    upload_body.len() as u64,
+                    &mime,
+                )
             }
         })
         .await
@@ -1749,6 +1912,7 @@ mod retry_policy_tests {
     use axum::routing::post;
     use axum::Router;
     use nostr::{EventBuilder, Keys, Kind};
+    use sha2::{Digest, Sha256};
     use tokio::net::TcpListener;
 
     use super::super::error::CliError;
@@ -2345,6 +2509,7 @@ mod retry_policy_tests {
         ];
         tmp.write_all(jpeg_header).unwrap();
         let file_path = tmp.path().to_str().unwrap().to_string();
+        let expected_sha256 = hex::encode(Sha256::digest(jpeg_header));
 
         let counter = Arc::new(AtomicU32::new(0));
         let counter2 = counter.clone();
@@ -2354,6 +2519,7 @@ mod retry_policy_tests {
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
+        let descriptor_url = format!("http://{addr}/media/{expected_sha256}.jpg");
 
         tokio::spawn(async move {
             loop {
@@ -2384,7 +2550,14 @@ mod retry_policy_tests {
                     let _ = stream.write_all(partial).await;
                 } else {
                     // Valid BlobDescriptor response.
-                    let ok_body = r#"{"url":"https://relay.test/media/aabbcc.jpg","sha256":"aabbcc","size":12,"type":"image/jpeg","uploaded":0}"#;
+                    let ok_body = serde_json::json!({
+                        "url": descriptor_url,
+                        "sha256": expected_sha256,
+                        "size": jpeg_header.len(),
+                        "type": "image/jpeg",
+                        "uploaded": 0,
+                    })
+                    .to_string();
                     let ok = format!(
                         "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{}",
                         ok_body.len(),
