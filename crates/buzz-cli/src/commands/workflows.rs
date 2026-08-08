@@ -193,14 +193,34 @@ pub async fn cmd_trigger_workflow(
         .tags(tags);
         let event = client.sign_event(builder)?;
         let resp = client.submit_event(event).await?;
-        println!("{}", normalize_write_response(&resp));
+        print_workflow_trigger_response(&resp)?;
     } else {
         let builder = buzz_sdk::build_workflow_trigger(wf_uuid).map_err(sdk_err)?;
         let event = client.sign_event(builder)?;
         let resp = client.submit_event(event).await?;
-        println!("{}", normalize_write_response(&resp));
+        print_workflow_trigger_response(&resp)?;
     }
     Ok(())
+}
+
+fn print_workflow_trigger_response(resp: &str) -> Result<(), CliError> {
+    let run_id = validate_workflow_trigger_response(resp)?;
+    print_create_response(resp, "run_id", &run_id);
+    Ok(())
+}
+
+fn validate_workflow_trigger_response(resp: &str) -> Result<String, CliError> {
+    let run_id = extract_relay_response_field(resp, "run_id").ok_or_else(|| {
+        CliError::DeliveryUnknown(
+            "workflow trigger succeeded without a canonical run_id; outcome unknown".into(),
+        )
+    })?;
+    parse_uuid(&run_id).map_err(|_| {
+        CliError::DeliveryUnknown(
+            "workflow trigger returned an invalid canonical run_id; outcome unknown".into(),
+        )
+    })?;
+    Ok(run_id)
 }
 
 /// Approve or deny a workflow step — sign and submit a kind:46030 (grant) or 46031 (deny) event.
@@ -259,7 +279,8 @@ pub async fn dispatch(cmd: crate::WorkflowsCmd, client: &BuzzClient) -> Result<(
 #[cfg(test)]
 mod tests {
     use super::{
-        normalize_workflow_runs_response, validate_workflow_create_response, workflow_runs_path,
+        normalize_workflow_runs_response, validate_workflow_create_response,
+        validate_workflow_trigger_response, workflow_runs_path,
     };
 
     const WORKFLOW_ID: &str = "11111111-1111-4111-8111-111111111111";
@@ -311,6 +332,20 @@ mod tests {
             r#"{"message":"response:{\"workflow_id\":\"22222222-2222-4222-8222-222222222222\"}"}"#,
         ] {
             assert!(validate_workflow_create_response(invalid, expected).is_err());
+        }
+    }
+
+    #[test]
+    fn workflow_trigger_receipt_requires_a_canonical_run_id() {
+        let run_id = "33333333-3333-4333-8333-333333333333";
+        let valid = format!(r#"{{"message":"response:{{\"run_id\":\"{run_id}\"}}"}}"#);
+        assert_eq!(validate_workflow_trigger_response(&valid).unwrap(), run_id);
+
+        for invalid in [
+            r#"{"message":"duplicate: already processed"}"#,
+            r#"{"message":"response:{\"run_id\":\"not-a-uuid\"}"}"#,
+        ] {
+            assert!(validate_workflow_trigger_response(invalid).is_err());
         }
     }
 }

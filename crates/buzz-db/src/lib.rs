@@ -3788,6 +3788,22 @@ impl Db {
         workflow::get_workflow_run(&self.pool, community_id, id).await
     }
 
+    /// Fetch the run produced by an exact trigger event.
+    pub async fn get_workflow_run_by_trigger_event(
+        &self,
+        community_id: CommunityId,
+        workflow_id: Uuid,
+        trigger_event_id: &[u8],
+    ) -> Result<Option<workflow::WorkflowRunRecord>> {
+        workflow::get_workflow_run_by_trigger_event(
+            &self.pool,
+            community_id,
+            workflow_id,
+            trigger_event_id,
+        )
+        .await
+    }
+
     /// List runs for a workflow.
     pub async fn list_workflow_runs(
         &self,

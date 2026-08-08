@@ -822,6 +822,37 @@ pub async fn create_workflow_run(
     Ok(id)
 }
 
+/// Insert a workflow run inside the caller's existing transaction.
+///
+/// Manual command triggers use this so the signed trigger event and its run
+/// either commit together or both roll back.
+pub async fn create_workflow_run_in_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    community_id: CommunityId,
+    workflow_id: Uuid,
+    trigger_event_id: Option<&[u8]>,
+    trigger_context: Option<&serde_json::Value>,
+) -> Result<Uuid> {
+    let id = Uuid::new_v4();
+
+    sqlx::query(
+        r#"
+        INSERT INTO workflow_runs
+            (community_id, id, workflow_id, status, trigger_event_id, current_step, execution_trace, trigger_context)
+        VALUES ($1, $2, $3, 'pending', $4, 0, '[]', $5)
+        "#,
+    )
+    .bind(community_id.as_uuid())
+    .bind(id)
+    .bind(workflow_id)
+    .bind(trigger_event_id)
+    .bind(trigger_context)
+    .execute(&mut **tx)
+    .await?;
+
+    Ok(id)
+}
+
 /// Fetch a single workflow run by ID, scoped to its community.
 pub async fn get_workflow_run(
     pool: &PgPool,
@@ -843,6 +874,38 @@ pub async fn get_workflow_run(
     .ok_or_else(|| DbError::NotFound(format!("workflow_run {id}")))?;
 
     row_to_run_record(row)
+}
+
+/// Fetch the run created by a specific trigger event, scoped to its community
+/// and workflow. At most one row is valid because command-event persistence is
+/// the idempotency guard for manual triggers.
+pub async fn get_workflow_run_by_trigger_event(
+    pool: &PgPool,
+    community_id: CommunityId,
+    workflow_id: Uuid,
+    trigger_event_id: &[u8],
+) -> Result<Option<WorkflowRunRecord>> {
+    let rows = sqlx::query(
+        r#"
+        SELECT community_id, id, workflow_id, status::text AS status, trigger_event_id, current_step,
+               execution_trace, trigger_context, started_at, completed_at, error_message, created_at
+        FROM workflow_runs
+        WHERE community_id = $1 AND workflow_id = $2 AND trigger_event_id = $3
+        LIMIT 2
+        "#,
+    )
+    .bind(community_id.as_uuid())
+    .bind(workflow_id)
+    .bind(trigger_event_id)
+    .fetch_all(pool)
+    .await?;
+
+    if rows.len() > 1 {
+        return Err(DbError::InvalidData(
+            "multiple workflow runs share one trigger event".into(),
+        ));
+    }
+    rows.into_iter().next().map(row_to_run_record).transpose()
 }
 
 /// List runs for a workflow, newest first, up to `limit` rows.

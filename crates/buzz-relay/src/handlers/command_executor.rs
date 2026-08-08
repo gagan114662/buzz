@@ -96,7 +96,9 @@ enum PersistResult {
 /// not strictly atomic: if a mutation succeeds but commit fails, the mutation
 /// persists without the event record. On retry, the event INSERT succeeds
 /// (no conflict), and the mutation re-executes — which is safe for idempotent
-/// operations (open_dm, hide_dm, update_approval, upsert_workflow).
+/// operations (open_dm, hide_dm, update_approval, upsert_workflow). Workflow
+/// trigger run creation is deliberately executed inside this transaction
+/// because starting a second run is not idempotent.
 async fn persist_command_event(
     state: &Arc<AppState>,
     tenant: &TenantContext,
@@ -915,12 +917,22 @@ async fn handle_workflow_trigger(
     // Persist the command event under the workflow channel even though the
     // trigger event itself only carries the workflow UUID. Storing channel
     // triggers as global events leaks workflow IDs to unrelated relay members.
-    let tx = match persist_command_event(state, tenant, event, workflow.channel_id).await? {
+    let mut tx = match persist_command_event(state, tenant, event, workflow.channel_id).await? {
         PersistResult::Duplicate => {
+            let run = state
+                .db
+                .get_workflow_run_by_trigger_event(community_id, workflow_id, event.id.as_bytes())
+                .await
+                .map_err(|e| IngestError::Internal(format!("error: db find workflow run: {e}")))?
+                .ok_or_else(|| {
+                    IngestError::Internal(
+                        "error: processed workflow trigger has no matching run".into(),
+                    )
+                })?;
             return Ok(IngestResult {
                 event_id: event.id.to_hex(),
                 accepted: true,
-                message: "duplicate: already processed".into(),
+                message: workflow_trigger_response_message(run.id),
             });
         }
         PersistResult::Inserted(tx) => tx,
@@ -949,16 +961,15 @@ async fn handle_workflow_trigger(
     let trigger_ctx_json = serde_json::to_value(&trigger_ctx).ok();
 
     let event_id_bytes = event.id.as_bytes().to_vec();
-    let run_id = state
-        .db
-        .create_workflow_run(
-            community_id,
-            workflow_id,
-            Some(&event_id_bytes),
-            trigger_ctx_json.as_ref(),
-        )
-        .await
-        .map_err(|e| IngestError::Internal(format!("error: db create_workflow_run: {e}")))?;
+    let run_id = buzz_db::workflow::create_workflow_run_in_tx(
+        &mut tx,
+        community_id,
+        workflow_id,
+        Some(&event_id_bytes),
+        trigger_ctx_json.as_ref(),
+    )
+    .await
+    .map_err(|e| IngestError::Internal(format!("error: db create_workflow_run: {e}")))?;
 
     // Commit: event + run creation succeeded atomically.
     tx.commit()
@@ -1011,13 +1022,17 @@ async fn handle_workflow_trigger(
     Ok(IngestResult {
         event_id: event.id.to_hex(),
         accepted: true,
-        message: format!(
-            "response:{}",
-            serde_json::json!({
-                "run_id": run_id.to_string(),
-            })
-        ),
+        message: workflow_trigger_response_message(run_id),
     })
+}
+
+fn workflow_trigger_response_message(run_id: Uuid) -> String {
+    format!(
+        "response:{}",
+        serde_json::json!({
+            "run_id": run_id.to_string(),
+        })
+    )
 }
 
 /// Enforce the approver_spec field against the requesting pubkey.
@@ -1492,6 +1507,15 @@ mod tests {
         let payload: serde_json::Value =
             serde_json::from_str(message.strip_prefix("response:").unwrap()).unwrap();
         assert!(payload.get("webhook_secret").is_none());
+    }
+
+    #[test]
+    fn workflow_trigger_receipt_always_carries_the_canonical_run_id() {
+        let run_id = Uuid::parse_str("33333333-3333-4333-8333-333333333333").unwrap();
+        let message = workflow_trigger_response_message(run_id);
+        let payload: serde_json::Value =
+            serde_json::from_str(message.strip_prefix("response:").unwrap()).unwrap();
+        assert_eq!(payload["run_id"], run_id.to_string());
     }
 
     #[test]
