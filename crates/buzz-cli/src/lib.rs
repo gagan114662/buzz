@@ -1806,11 +1806,11 @@ pub enum ModerationCmd {
     )]
     Reports {
         /// Filter by status: open | resolved | dismissed | escalated (default: all)
-        #[arg(long)]
+        #[arg(long, value_parser = ["open", "resolved", "dismissed", "escalated"])]
         status: Option<String>,
         /// Maximum number of reports to return
-        #[arg(long, default_value_t = 50)]
-        limit: i64,
+        #[arg(long, default_value_t = 50, value_parser = clap::value_parser!(u32).range(1..=500))]
+        limit: u32,
     },
     /// Resolve or dismiss a report (kind 9044)
     #[command(
@@ -1883,8 +1883,8 @@ pub enum ModerationCmd {
     /// Read the moderation audit trail (newest first)
     Audit {
         /// Maximum number of audit rows to return
-        #[arg(long, default_value_t = 50)]
-        limit: i64,
+        #[arg(long, default_value_t = 50, value_parser = clap::value_parser!(u32).range(1..=500))]
+        limit: u32,
     },
 }
 
@@ -2075,6 +2075,36 @@ mod tests {
             "--emoji alone must not imply a status"
         );
         assert!(Cli::try_parse_from(["buzz", "users", "set-status", "--clear"]).is_ok());
+    }
+
+    #[test]
+    fn moderation_read_filters_are_bounded_before_signing() {
+        assert!(Cli::try_parse_from([
+            "buzz",
+            "moderation",
+            "reports",
+            "--status",
+            "open&limit=500",
+        ])
+        .is_err());
+        for args in [
+            ["buzz", "moderation", "reports", "--limit", "0"],
+            ["buzz", "moderation", "reports", "--limit", "501"],
+            ["buzz", "moderation", "audit", "--limit", "0"],
+            ["buzz", "moderation", "audit", "--limit", "501"],
+        ] {
+            assert!(Cli::try_parse_from(args).is_err());
+        }
+        assert!(Cli::try_parse_from([
+            "buzz",
+            "moderation",
+            "reports",
+            "--status",
+            "escalated",
+            "--limit",
+            "500",
+        ])
+        .is_ok());
     }
 
     #[test]

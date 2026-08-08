@@ -113,7 +113,7 @@ async fn cmd_resolve(
 async fn cmd_reports(
     client: &BuzzClient,
     status: Option<&str>,
-    limit: i64,
+    limit: u32,
 ) -> Result<(), CliError> {
     let mut path = format!("/moderation/reports?limit={limit}");
     if let Some(s) = status {
@@ -136,7 +136,7 @@ async fn cmd_restricted(client: &BuzzClient) -> Result<(), CliError> {
     Ok(())
 }
 
-async fn cmd_audit(client: &BuzzClient, limit: i64) -> Result<(), CliError> {
+async fn cmd_audit(client: &BuzzClient, limit: u32) -> Result<(), CliError> {
     let resp = client
         .get_authed(&format!("/moderation/audit?limit={limit}"))
         .await?;
