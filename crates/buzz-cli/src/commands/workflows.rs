@@ -57,39 +57,29 @@ pub async fn cmd_get_workflow(client: &BuzzClient, workflow_id: &str) -> Result<
     Ok(())
 }
 
-/// Get workflow run history — query kinds [46001, 46002, 46003].
-///
-/// NOTE: The relay does not currently emit workflow execution events (46001-46003).
-/// Run history is stored in the workflow_runs DB table, not as Nostr events.
-/// This command will return an empty array until the relay adds event emission
-/// or a dedicated REST endpoint for run history.
+fn workflow_runs_path(workflow_id: &str, limit: Option<u32>) -> String {
+    let limit = limit.unwrap_or(20).clamp(1, 100);
+    format!("/api/workflows/{workflow_id}/runs?limit={limit}")
+}
+
+fn normalize_workflow_runs_response(response: &str) -> Result<String, CliError> {
+    let runs: Vec<serde_json::Value> = serde_json::from_str(response)
+        .map_err(|error| CliError::Other(format!("invalid workflow run response: {error}")))?;
+    serde_json::to_string(&runs)
+        .map_err(|error| CliError::Other(format!("workflow run serialization failed: {error}")))
+}
+
+/// Get authoritative workflow run history from the relay database.
 pub async fn cmd_get_workflow_runs(
     client: &BuzzClient,
     workflow_id: &str,
     limit: Option<u32>,
 ) -> Result<(), CliError> {
     validate_uuid(workflow_id)?;
-    let limit = limit.unwrap_or(20).min(100);
-    let filter = serde_json::json!({
-        "kinds": [46001, 46002, 46003],
-        "#d": [workflow_id],
-        "limit": limit
-    });
-    let resp = client.query(&filter).await?;
-    let events: Vec<serde_json::Value> = serde_json::from_str(&resp).unwrap_or_default();
-    let normalized: Vec<serde_json::Value> = events
-        .iter()
-        .map(|e| {
-            serde_json::json!({
-                "event_id": e.get("id").and_then(|v| v.as_str()).unwrap_or(""),
-                "kind": e.get("kind").and_then(|v| v.as_u64()).unwrap_or(0),
-                "content": e.get("content").and_then(|v| v.as_str()).unwrap_or(""),
-                "created_at": e.get("created_at").and_then(|v| v.as_u64()).unwrap_or(0),
-                "tags": e.get("tags").cloned().unwrap_or(serde_json::json!([])),
-            })
-        })
-        .collect();
-    let output = serde_json::to_string(&normalized).unwrap_or_default();
+    let response = client
+        .get_authed(&workflow_runs_path(workflow_id, limit))
+        .await?;
+    let output = normalize_workflow_runs_response(&response)?;
     println!("{output}");
     Ok(())
 }
@@ -239,5 +229,44 @@ pub async fn dispatch(cmd: crate::WorkflowsCmd, client: &BuzzClient) -> Result<(
             // approved is already a bool — no parse_bool_flag needed
             cmd_approve_step(client, &token, approved, note.as_deref()).await
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{normalize_workflow_runs_response, workflow_runs_path};
+
+    const WORKFLOW_ID: &str = "11111111-1111-4111-8111-111111111111";
+
+    #[test]
+    fn workflow_runs_path_defaults_and_clamps_the_limit() {
+        assert_eq!(
+            workflow_runs_path(WORKFLOW_ID, None),
+            format!("/api/workflows/{WORKFLOW_ID}/runs?limit=20")
+        );
+        assert_eq!(
+            workflow_runs_path(WORKFLOW_ID, Some(0)),
+            format!("/api/workflows/{WORKFLOW_ID}/runs?limit=1")
+        );
+        assert_eq!(
+            workflow_runs_path(WORKFLOW_ID, Some(500)),
+            format!("/api/workflows/{WORKFLOW_ID}/runs?limit=100")
+        );
+    }
+
+    #[test]
+    fn workflow_runs_response_preserves_authoritative_rows() {
+        let response = r#"[{"id":"run-1","status":"succeeded","execution_trace":["step-a"]}]"#;
+        let normalized = normalize_workflow_runs_response(response).unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&normalized).unwrap(),
+            serde_json::from_str::<serde_json::Value>(response).unwrap()
+        );
+    }
+
+    #[test]
+    fn workflow_runs_response_rejects_non_array_or_malformed_json() {
+        assert!(normalize_workflow_runs_response(r#"{"id":"run-1"}"#).is_err());
+        assert!(normalize_workflow_runs_response("not-json").is_err());
     }
 }
