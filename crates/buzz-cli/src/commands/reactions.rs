@@ -6,6 +6,8 @@ use crate::client::{normalize_write_response, BuzzClient};
 use crate::error::CliError;
 use crate::validate::validate_hex64;
 
+use super::parse_relay_event_array;
+
 pub async fn cmd_add_reaction(
     client: &BuzzClient,
     event_id: &str,
@@ -84,7 +86,7 @@ pub async fn cmd_get_reactions(client: &BuzzClient, event_id: &str) -> Result<()
         "#e": [event_id]
     });
     let resp = client.query(&filter).await?;
-    let events: Vec<serde_json::Value> = serde_json::from_str(&resp).unwrap_or_default();
+    let events = parse_relay_event_array(&resp, "reactions query")?;
 
     let mut groups: HashMap<String, Vec<String>> = HashMap::new();
     for e in &events {

@@ -5,6 +5,8 @@ use crate::client::{extract_d_tag, normalize_write_response, BuzzClient};
 use crate::error::CliError;
 use crate::validate::validate_hex64;
 
+use super::parse_relay_event_array;
+
 /// Get user profiles (kind:0 metadata events).
 ///
 /// - 0 pubkeys, no name → query our own profile
@@ -50,7 +52,7 @@ pub async fn cmd_get_users(
         "limit": authors.len()
     });
     let resp = client.query(&filter).await?;
-    let events: Vec<serde_json::Value> = serde_json::from_str(&resp).unwrap_or_default();
+    let events = parse_relay_event_array(&resp, "user profile query")?;
     let profiles: Vec<serde_json::Value> = events
         .iter()
         .filter_map(|e| {
@@ -432,22 +434,27 @@ async fn fetch_current_profile(
         "limit": 1
     });
     let raw = client.query(&filter).await?;
-    let events: serde_json::Value = serde_json::from_str(&raw)
-        .map_err(|e| CliError::Other(format!("failed to parse profile query: {e}")))?;
+    let events = parse_relay_event_array(&raw, "current profile query")?;
+    parse_current_profile(&events)
+}
 
-    let Some(arr) = events.as_array() else {
-        return Ok(serde_json::Map::new());
-    };
-    let Some(event) = arr.first() else {
+fn parse_current_profile(
+    events: &[serde_json::Value],
+) -> Result<serde_json::Map<String, serde_json::Value>, CliError> {
+    let Some(event) = events.first() else {
         return Ok(serde_json::Map::new());
     };
     // kind:0 content is a JSON string containing the profile fields
     let content_str = event
         .get("content")
         .and_then(|c| c.as_str())
-        .unwrap_or("{}");
-    let content: serde_json::Value = serde_json::from_str(content_str).unwrap_or_default();
-    Ok(content.as_object().cloned().unwrap_or_default())
+        .ok_or_else(|| CliError::Other("current profile event has no string content".into()))?;
+    let content: serde_json::Value = serde_json::from_str(content_str)
+        .map_err(|e| CliError::Other(format!("invalid current profile content: {e}")))?;
+    content
+        .as_object()
+        .cloned()
+        .ok_or_else(|| CliError::Other("current profile content is not a JSON object".into()))
 }
 
 /// Get presence status for users — query kind:40902 presence snapshot events.
@@ -467,7 +474,7 @@ pub async fn cmd_get_presence(client: &BuzzClient, pubkeys_csv: &str) -> Result<
         "limit": pubkeys.len()
     });
     let resp = client.query(&filter).await?;
-    let events: Vec<serde_json::Value> = serde_json::from_str(&resp).unwrap_or_default();
+    let events = parse_relay_event_array(&resp, "presence query")?;
     let presence: Vec<serde_json::Value> = events
         .iter()
         .map(|e| {
@@ -573,10 +580,25 @@ pub async fn dispatch(
 mod tests {
     use super::{
         owned_agent_pubkeys_from_events, owner_scoped_profiles, owner_verification,
-        presence_subject,
+        parse_current_profile, presence_subject,
     };
     use nostr::Keys;
     use serde_json::json;
+
+    #[test]
+    fn current_profile_merge_rejects_untrustworthy_existing_content() {
+        assert!(parse_current_profile(&[]).unwrap().is_empty());
+
+        let profile = parse_current_profile(&[json!({
+            "content": r#"{"display_name":"Buzz","about":"kept"}"#
+        })])
+        .unwrap();
+        assert_eq!(profile["about"], "kept");
+
+        assert!(parse_current_profile(&[json!({})]).is_err());
+        assert!(parse_current_profile(&[json!({"content": "not-json"})]).is_err());
+        assert!(parse_current_profile(&[json!({"content": "[]"})]).is_err());
+    }
 
     #[test]
     fn owned_agent_lookup_matches_exact_name_case_insensitively() {

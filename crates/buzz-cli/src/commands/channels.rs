@@ -13,6 +13,8 @@ use crate::commands::channel_templates::{self, ChannelTemplateRecord, TemplateAg
 use crate::error::CliError;
 use crate::validate::{parse_uuid, read_or_stdin, validate_hex64, validate_uuid};
 
+use super::parse_relay_event_array;
+
 fn extract_channel_metadata(e: &serde_json::Value) -> serde_json::Value {
     serde_json::json!({
         "channel_id": extract_d_tag(e),
@@ -229,7 +231,7 @@ pub async fn cmd_get_channel(client: &BuzzClient, channel_id: &str) -> Result<()
         "limit": 1
     });
     let resp = client.query(&filter).await?;
-    let events: Vec<serde_json::Value> = serde_json::from_str(&resp).unwrap_or_default();
+    let events = parse_relay_event_array(&resp, "channel query")?;
     if let Some(e) = events.first() {
         let mut normalized = extract_channel_metadata(e);
         normalized["pubkey"] =
@@ -252,7 +254,7 @@ pub async fn cmd_list_channel_members(
         "limit": 1
     });
     let resp = client.query(&filter).await?;
-    let events: Vec<serde_json::Value> = serde_json::from_str(&resp).unwrap_or_default();
+    let events = parse_relay_event_array(&resp, "channel members query")?;
     let members = events.first().map(extract_p_tags).unwrap_or_default();
     let output = serde_json::to_string(&members).unwrap_or_default();
     println!("{output}");
@@ -266,7 +268,7 @@ pub async fn cmd_get_canvas(client: &BuzzClient, channel_id: &str) -> Result<(),
         "#h": [channel_id]
     });
     let resp = client.query(&filter).await?;
-    let events: Vec<serde_json::Value> = serde_json::from_str(&resp).unwrap_or_default();
+    let events = parse_relay_event_array(&resp, "canvas query")?;
     if let Some(content) = events
         .first()
         .and_then(|e| e.get("content"))
