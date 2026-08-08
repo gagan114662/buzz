@@ -31,11 +31,18 @@ fn normalize_moderation_rows(raw: &str, operation: &str) -> Result<String, CliEr
 
 /// Resolve `--expires-in <secs>` / `--expires-at <unix>` into an absolute
 /// unix-seconds expiry. At most one may be set (enforced by clap).
-fn resolve_expiry(expires_in: Option<u64>, expires_at: Option<u64>) -> Option<u64> {
+fn resolve_expiry(
+    expires_in: Option<u64>,
+    expires_at: Option<u64>,
+) -> Result<Option<u64>, CliError> {
     match (expires_in, expires_at) {
-        (Some(secs), _) => Some(Timestamp::now().as_secs() + secs),
-        (None, Some(ts)) => Some(ts),
-        (None, None) => None,
+        (Some(secs), _) => Timestamp::now()
+            .as_secs()
+            .checked_add(secs)
+            .map(Some)
+            .ok_or_else(|| CliError::Usage("--expires-in produces an invalid timestamp".into())),
+        (None, Some(ts)) => Ok(Some(ts)),
+        (None, None) => Ok(None),
     }
 }
 
@@ -47,7 +54,7 @@ async fn cmd_ban(
     reason: Option<&str>,
 ) -> Result<(), CliError> {
     validate_hex64(pubkey)?;
-    let expiry = resolve_expiry(expires_in, expires_at);
+    let expiry = resolve_expiry(expires_in, expires_at)?;
     let builder = buzz_sdk::build_moderation_ban(pubkey, expiry, reason)
         .map_err(|e| CliError::Usage(format!("invalid ban: {e}")))?;
     let event = client.sign_event(builder)?;
@@ -74,7 +81,7 @@ async fn cmd_timeout(
     reason: Option<&str>,
 ) -> Result<(), CliError> {
     validate_hex64(pubkey)?;
-    let expiry = resolve_expiry(expires_in, expires_at)
+    let expiry = resolve_expiry(expires_in, expires_at)?
         .ok_or_else(|| CliError::Usage("timeout requires --expires-in or --expires-at".into()))?;
     let builder = buzz_sdk::build_moderation_timeout(pubkey, expiry, reason)
         .map_err(|e| CliError::Usage(format!("invalid timeout: {e}")))?;
@@ -146,7 +153,14 @@ async fn cmd_audit(client: &BuzzClient, limit: u32) -> Result<(), CliError> {
 
 #[cfg(test)]
 mod tests {
-    use super::normalize_moderation_rows;
+    use super::{normalize_moderation_rows, resolve_expiry};
+
+    #[test]
+    fn relative_moderation_expiry_rejects_timestamp_overflow() {
+        assert!(resolve_expiry(Some(u64::MAX), None).is_err());
+        assert_eq!(resolve_expiry(None, Some(42)).unwrap(), Some(42));
+        assert_eq!(resolve_expiry(None, None).unwrap(), None);
+    }
 
     #[test]
     fn moderation_reads_reject_malformed_or_wrong_shaped_success_bodies() {
