@@ -683,6 +683,9 @@ mod media_download_tests {
 }
 
 const QUERY_PAGE_SIZE: u32 = 500;
+/// Defense-in-depth for one HTTP query response, including filters without an
+/// explicit NIP-01 limit.
+const MAX_QUERY_RESPONSE_EVENTS: usize = 5_000;
 /// `query_all` is used for managed-agent inventory/name resolution. Refuse an
 /// implausibly large inventory rather than accumulating an unbounded stream or
 /// silently resolving against a partial result set.
@@ -809,13 +812,33 @@ fn validate_query_response(
 ) -> Result<(), CliError> {
     let events: Vec<nostr::Event> = serde_json::from_str(raw)
         .map_err(|error| CliError::Other(format!("invalid relay query response: {error}")))?;
+    let explicit_limit = filters.iter().try_fold(0_usize, |total, filter| {
+        filter.limit.and_then(|limit| total.checked_add(limit))
+    });
+    let response_limit = explicit_limit
+        .unwrap_or(MAX_QUERY_RESPONSE_EVENTS)
+        .min(MAX_QUERY_RESPONSE_EVENTS);
+    if events.len() > response_limit {
+        return Err(CliError::Other(format!(
+            "relay query returned {} events, exceeding the {response_limit}-event response limit",
+            events.len()
+        )));
+    }
+
     let match_options = MatchEventOptions::new().nip50(false);
+    let mut seen_event_ids = HashSet::new();
     for (index, event) in events.iter().enumerate() {
         event.verify().map_err(|error| {
             CliError::Other(format!(
                 "relay query event at index {index} failed verification: {error}"
             ))
         })?;
+        if !seen_event_ids.insert(event.id) {
+            return Err(CliError::Other(format!(
+                "relay query repeated event {}",
+                event.id.to_hex()
+            )));
+        }
         let matches_requested_filter =
             raw_filters.iter().zip(filters).any(|(raw_filter, filter)| {
                 filter.match_event(event, match_options)
@@ -3093,6 +3116,34 @@ mod tests {
         let raw_or_filters = vec![wrong_kind, matching.clone()];
         let or_filters = parse_query_filters(&raw_or_filters).unwrap();
         assert!(validate_query_response(&valid, &raw_or_filters, &or_filters).is_ok());
+
+        let duplicate_response =
+            serde_json::to_string(&vec![event.clone(), event.clone()]).unwrap();
+        assert!(validate_query_response(
+            &duplicate_response,
+            std::slice::from_ref(&matching),
+            &filters
+        )
+        .is_err());
+
+        let second_event = EventBuilder::new(Kind::TextNote, "second")
+            .sign_with_keys(&keys)
+            .unwrap();
+        let two_events = serde_json::to_string(&vec![event.clone(), second_event]).unwrap();
+        let limited = serde_json::json!({"kinds": [1], "limit": 1});
+        let limited_filters = parse_query_filters(std::slice::from_ref(&limited)).unwrap();
+        assert!(validate_query_response(
+            &two_events,
+            std::slice::from_ref(&limited),
+            &limited_filters
+        )
+        .is_err());
+
+        let two_limited_filters = vec![limited.clone(), limited];
+        let parsed_two_limits = parse_query_filters(&two_limited_filters).unwrap();
+        assert!(
+            validate_query_response(&two_events, &two_limited_filters, &parsed_two_limits).is_ok()
+        );
 
         // Relay full-text search can use stemming or extensions, so local
         // binding enforces every structural field but not search relevance.
