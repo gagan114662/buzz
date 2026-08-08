@@ -682,6 +682,21 @@ mod media_download_tests {
 }
 
 const QUERY_PAGE_SIZE: u32 = 500;
+/// `query_all` is used for managed-agent inventory/name resolution. Refuse an
+/// implausibly large inventory rather than accumulating an unbounded stream or
+/// silently resolving against a partial result set.
+const QUERY_ALL_MAX_EVENTS: u32 = 5_000;
+
+fn enforce_query_all_limit(
+    events: Vec<serde_json::Value>,
+) -> Result<Vec<serde_json::Value>, CliError> {
+    if events.len() > QUERY_ALL_MAX_EVENTS as usize {
+        return Err(CliError::Other(format!(
+            "query-all result exceeds the {QUERY_ALL_MAX_EVENTS}-event safety limit; refusing partial results"
+        )));
+    }
+    Ok(events)
+}
 
 fn advance_query_cursor(
     filter: &mut serde_json::Value,
@@ -969,7 +984,12 @@ impl BuzzClient {
         &self,
         filter: serde_json::Value,
     ) -> Result<Vec<serde_json::Value>, CliError> {
-        self.query_pages(filter, None).await
+        // Fetch one sentinel event beyond the advertised ceiling so hitting
+        // the cap is distinguishable from completing exactly at the cap.
+        let events = self
+            .query_pages(filter, Some(QUERY_ALL_MAX_EVENTS + 1))
+            .await?;
+        enforce_query_all_limit(events)
     }
 
     /// Sign an event builder verbatim: no NIP-OA auth-tag injection, and none
@@ -2883,9 +2903,10 @@ mod retry_policy_tests {
 #[cfg(test)]
 mod tests {
     use super::{
-        advance_query_cursor, create_response_with_id_if_accepted, extract_relay_response_field,
-        normalize_relay_url, record_query_cursor, to_ws_url, validate_query_page,
-        validate_query_response, validate_submit_event_response, BuzzClient,
+        advance_query_cursor, create_response_with_id_if_accepted, enforce_query_all_limit,
+        extract_relay_response_field, normalize_relay_url, record_query_cursor, to_ws_url,
+        validate_query_page, validate_query_response, validate_submit_event_response, BuzzClient,
+        QUERY_ALL_MAX_EVENTS,
     };
     use nostr::{EventBuilder, Keys, Kind, Tag};
     use std::collections::HashSet;
@@ -2970,6 +2991,18 @@ mod tests {
         let cursor = (10, "a".repeat(64));
         assert!(record_query_cursor(&mut seen_cursors, cursor.clone()).is_ok());
         assert!(record_query_cursor(&mut seen_cursors, cursor).is_err());
+    }
+
+    #[test]
+    fn query_all_limit_rejects_sentinel_without_returning_partial_results() {
+        let at_limit = vec![serde_json::Value::Null; QUERY_ALL_MAX_EVENTS as usize];
+        assert_eq!(
+            enforce_query_all_limit(at_limit).unwrap().len(),
+            QUERY_ALL_MAX_EVENTS as usize
+        );
+
+        let beyond_limit = vec![serde_json::Value::Null; QUERY_ALL_MAX_EVENTS as usize + 1];
+        assert!(enforce_query_all_limit(beyond_limit).is_err());
     }
 
     #[test]
