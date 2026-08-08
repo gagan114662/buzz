@@ -3883,6 +3883,14 @@ impl Db {
         workflow::get_run_approvals(&self.pool, community_id, workflow_id, run_id).await
     }
 
+    /// List resolved approval gates whose runs still need to resume.
+    pub async fn list_resolved_workflow_approvals(
+        &self,
+        limit: i64,
+    ) -> Result<Vec<workflow::ResolvedWorkflowApproval>> {
+        workflow::list_resolved_workflow_approvals(&self.pool, limit).await
+    }
+
     /// Update an approval's status.
     pub async fn update_approval(
         &self,

@@ -267,6 +267,24 @@ pub struct ApprovalRecord {
     pub created_at: DateTime<Utc>,
 }
 
+/// A resolved approval whose workflow run is still waiting to resume.
+///
+/// These rows drive crash recovery after the approval decision commits but
+/// before the relay starts the post-approval workflow task.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedWorkflowApproval {
+    /// Server-resolved community that owns the run.
+    pub community_id: CommunityId,
+    /// Workflow definition to resume.
+    pub workflow_id: Uuid,
+    /// Suspended run to resume.
+    pub run_id: Uuid,
+    /// Zero-based approval-step index.
+    pub step_index: i32,
+    /// Terminal decision that should be exposed to later steps.
+    pub status: ApprovalStatus,
+}
+
 // -- Workflow CRUD ------------------------------------------------------------
 
 /// Insert a new workflow record. Returns the new workflow's UUID.
@@ -1198,6 +1216,52 @@ pub async fn get_run_approvals(
     .await?;
 
     rows.into_iter().map(row_to_approval_record).collect()
+}
+
+/// List resolved approval gates whose runs are still durably suspended.
+///
+/// The result is bounded and ordered oldest-first. Callers must still take a
+/// per-run execution lock before resuming because several relay pods may see
+/// the same recovery candidate concurrently.
+pub async fn list_resolved_workflow_approvals(
+    pool: &PgPool,
+    limit: i64,
+) -> Result<Vec<ResolvedWorkflowApproval>> {
+    let limit = limit.clamp(1, LIST_MAX_LIMIT);
+    let rows = sqlx::query(
+        r#"
+        SELECT approvals.community_id, approvals.workflow_id, approvals.run_id,
+               approvals.step_index, approvals.status::text AS status
+        FROM workflow_approvals AS approvals
+        JOIN workflow_runs AS runs
+          ON runs.community_id = approvals.community_id
+         AND runs.id = approvals.run_id
+         AND runs.workflow_id = approvals.workflow_id
+        WHERE approvals.status IN ('granted', 'denied')
+          AND runs.status = 'waiting_approval'
+          AND approvals.step_index = runs.current_step
+        ORDER BY approvals.created_at, approvals.run_id
+        LIMIT $1
+        "#,
+    )
+    .bind(limit)
+    .fetch_all(pool)
+    .await?;
+
+    rows.into_iter()
+        .map(|row| {
+            let status = row
+                .try_get::<String, _>("status")?
+                .parse::<ApprovalStatus>()?;
+            Ok(ResolvedWorkflowApproval {
+                community_id: CommunityId::from_uuid(row.try_get("community_id")?),
+                workflow_id: row.try_get("workflow_id")?,
+                run_id: row.try_get("run_id")?,
+                step_index: row.try_get("step_index")?,
+                status,
+            })
+        })
+        .collect()
 }
 
 /// Update an approval's status, approver pubkey, and optional note.

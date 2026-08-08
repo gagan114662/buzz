@@ -1395,6 +1395,36 @@ async fn resume_workflow_after_approval(
     resume_index: usize,
     approved: bool,
 ) {
+    // Several relay pods (or an exact client retry) may discover the same
+    // durably waiting run. Hold a transaction-scoped advisory lock throughout
+    // execution so only one process can resume it. A process crash releases
+    // the lock automatically and leaves a still-waiting run recoverable.
+    let mut resume_guard = match db.begin_transaction().await {
+        Ok(tx) => tx,
+        Err(e) => {
+            tracing::error!("resume_workflow: failed to begin run guard for {run_id}: {e}");
+            return;
+        }
+    };
+    let lock_key = format!("workflow-approval-resume:{community_id}:{run_id}");
+    let acquired = match sqlx::query_scalar::<_, bool>(
+        "SELECT pg_try_advisory_xact_lock(hashtextextended($1, 0))",
+    )
+    .bind(&lock_key)
+    .fetch_one(&mut *resume_guard)
+    .await
+    {
+        Ok(acquired) => acquired,
+        Err(e) => {
+            tracing::error!("resume_workflow: failed to lock run {run_id}: {e}");
+            return;
+        }
+    };
+    if !acquired {
+        tracing::debug!("resume_workflow: run {run_id} is already being resumed");
+        return;
+    }
+
     let run = match db.get_workflow_run(community_id, run_id).await {
         Ok(r) => r,
         Err(e) => {
@@ -1486,6 +1516,39 @@ async fn resume_workflow_after_approval(
     engine
         .finalize_run(community_id, run_id, result, existing_trace)
         .await;
+    drop(resume_guard);
+}
+
+/// Recover approval decisions that committed before their in-memory resume
+/// task started. Safe to run on every relay pod: `resume_workflow_after_approval`
+/// serializes execution with a durable per-run advisory lock.
+pub async fn recover_resolved_workflow_approvals(state: &Arc<AppState>) {
+    const RECOVERY_BATCH: i64 = 100;
+    let approvals = match state
+        .db
+        .list_resolved_workflow_approvals(RECOVERY_BATCH)
+        .await
+    {
+        Ok(approvals) => approvals,
+        Err(e) => {
+            tracing::error!("workflow approval recovery sweep failed: {e}");
+            return;
+        }
+    };
+
+    for approval in approvals {
+        let approved = approval.status == ApprovalStatus::Granted;
+        resume_workflow_after_approval(
+            Arc::clone(&state.workflow_engine),
+            state.db.clone(),
+            approval.community_id,
+            approval.run_id,
+            approval.workflow_id,
+            approval.step_index as usize + 1,
+            approved,
+        )
+        .await;
+    }
 }
 
 fn complete_approval_trace(trace: &mut [serde_json::Value], step_id: &str, approved: bool) -> bool {
