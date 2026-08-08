@@ -39,6 +39,10 @@ pub enum CliError {
     #[error("delivery unknown: {0}")]
     DeliveryUnknown(String),
 
+    /// A relay response exceeded the protocol-specific in-memory ceiling.
+    #[error("{context} exceeded the {limit}-byte response limit")]
+    ResponseTooLarge { context: &'static str, limit: usize },
+
     /// Catch-all for unexpected failures
     #[error("{0}")]
     Other(String),
@@ -80,6 +84,7 @@ pub fn is_retryable_error(e: &CliError) -> bool {
         }
         CliError::Relay { status, .. } => matches!(status, 429 | 502 | 503 | 504),
         CliError::DeliveryUnknown(_) => false,
+        CliError::ResponseTooLarge { .. } => false,
         _ => false,
     }
 }
@@ -103,6 +108,7 @@ pub fn exit_code(e: &CliError) -> i32 {
         CliError::Conflict(_) => 5,
         CliError::NotFound(_) => 1,
         CliError::DeliveryUnknown(_) => 2,
+        CliError::ResponseTooLarge { .. } => 4,
         CliError::Other(_) => 4,
     }
 }
@@ -125,6 +131,7 @@ pub fn print_error(e: &CliError) {
         CliError::Conflict(_) => "conflict",
         CliError::NotFound(_) => "not_found",
         CliError::DeliveryUnknown(_) => "delivery_unknown",
+        CliError::ResponseTooLarge { .. } => "response_too_large",
         CliError::Other(_) => "error",
     };
     let obj = serde_json::json!({

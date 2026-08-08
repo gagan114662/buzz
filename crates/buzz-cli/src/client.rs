@@ -130,6 +130,45 @@ const RETRY_BASE_SECS: [f64; 2] = [0.5, 1.5];
 /// Defensive cap against pathological hints; real relay hints observed up to ~24 s.
 const RETRY_IN_MAX_SECS: u64 = 30;
 
+/// One query page contains at most 500 events and the relay permits event
+/// content up to 256 KiB, plus JSON/event metadata overhead.
+const MAX_RELAY_DATA_RESPONSE_BYTES: usize = 160 * 1024 * 1024;
+/// Control-plane acknowledgements and upload descriptors are intentionally tiny.
+const MAX_CONTROL_RESPONSE_BYTES: usize = 256 * 1024;
+/// Error details are diagnostic text, never bulk data.
+const MAX_ERROR_RESPONSE_BYTES: usize = 64 * 1024;
+
+async fn read_response_bytes_limited(
+    mut response: reqwest::Response,
+    limit: usize,
+    context: &'static str,
+) -> Result<bytes::Bytes, CliError> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > limit as u64)
+    {
+        return Err(CliError::ResponseTooLarge { context, limit });
+    }
+
+    let mut body = bytes::BytesMut::new();
+    while let Some(chunk) = response.chunk().await.map_err(CliError::Network)? {
+        if body.len().saturating_add(chunk.len()) > limit {
+            return Err(CliError::ResponseTooLarge { context, limit });
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body.freeze())
+}
+
+async fn read_response_text_limited(
+    response: reqwest::Response,
+    limit: usize,
+    context: &'static str,
+) -> Result<String, CliError> {
+    let body = read_response_bytes_limited(response, limit, context).await?;
+    Ok(String::from_utf8_lossy(&body).into_owned())
+}
+
 /// Returns a full-jitter delay for attempt `i`: a random duration in `[0, RETRY_BASE_SECS[i])`.
 fn jitter_delay(attempt: u32) -> Duration {
     Duration::from_secs_f64(RETRY_BASE_SECS[attempt as usize] * rand::random::<f64>())
@@ -243,6 +282,9 @@ fn is_stored_event_exhaustion_ambiguous(e: &CliError) -> bool {
         CliError::Relay {
             status: 502..=504, ..
         } => true,
+        // A success response may have crossed the storage boundary before the
+        // client rejected its oversized body.
+        CliError::ResponseTooLarge { .. } => true,
         // All other variants are not retried by with_retry_body; not ambiguous.
         _ => false,
     }
@@ -960,7 +1002,7 @@ impl BuzzClient {
             .header("Accept", "application/nostr+json")
             .send()
             .await?;
-        self.handle_response(resp).await
+        self.handle_response(resp, MAX_CONTROL_RESPONSE_BYTES).await
     }
 
     /// Execute a one-shot query via the HTTP bridge.
@@ -994,7 +1036,8 @@ impl BuzzClient {
                         )
                         .send()
                         .await?;
-                    self.handle_response(resp).await
+                    self.handle_response(resp, MAX_RELAY_DATA_RESPONSE_BYTES)
+                        .await
                 }
             })
             .await?;
@@ -1026,7 +1069,7 @@ impl BuzzClient {
                     )
                     .send()
                     .await?;
-                self.handle_response(resp).await
+                self.handle_response(resp, MAX_CONTROL_RESPONSE_BYTES).await
             }
         })
         .await
@@ -1048,7 +1091,8 @@ impl BuzzClient {
                     .with_auth_tag(self.http.get(&url).header("Authorization", auth))
                     .send()
                     .await?;
-                self.handle_response(resp).await
+                self.handle_response(resp, MAX_RELAY_DATA_RESPONSE_BYTES)
+                    .await
             }
         })
         .await
@@ -1138,7 +1182,18 @@ impl BuzzClient {
                         // "rate-limited:". A proxy-level 429 (or JSON-wrapped body
                         // whose field does not start with "rate-limited:") leaves
                         // relay execution state ambiguous.
-                        let body_text = resp.text().await.unwrap_or_default();
+                        let body_text = read_response_text_limited(
+                            resp,
+                            MAX_ERROR_RESPONSE_BYTES,
+                            "moderation rate-limit response",
+                        )
+                        .await
+                        .map_err(|e| {
+                            CliError::DeliveryUnknown(format!(
+                                "moderation command (kind {}) outcome unknown: {e}",
+                                event.kind.as_u16()
+                            ))
+                        })?;
                         let extracted = extract_relay_message_field(&body_text);
                         let msg = extracted.as_deref().unwrap_or(&body_text);
                         if msg.starts_with("rate-limited:") {
@@ -1176,11 +1231,22 @@ impl BuzzClient {
                         )));
                     }
                     // 2xx or definitive error (4xx other than 429): read body normally.
-                    let body_text = resp.text().await.map_err(|e| {
+                    let response_limit = if resp_was_success(status) {
+                        MAX_CONTROL_RESPONSE_BYTES
+                    } else {
+                        MAX_ERROR_RESPONSE_BYTES
+                    };
+                    let body_text = read_response_text_limited(
+                        resp,
+                        response_limit,
+                        "moderation command response",
+                    )
+                    .await
+                    .map_err(|e| {
                         // Body loss after relay confirmed receipt is ambiguous for
                         // non-idempotent commands.
                         CliError::DeliveryUnknown(format!(
-                            "moderation command (kind {}) outcome unknown: response body lost: {e}",
+                            "moderation command (kind {}) outcome unknown: unusable response body: {e}",
                             event.kind.as_u16()
                         ))
                     })?;
@@ -1252,7 +1318,7 @@ impl BuzzClient {
                         )
                         .send()
                         .await?;
-                    self.handle_response(resp).await
+                    self.handle_response(resp, MAX_CONTROL_RESPONSE_BYTES).await
                 }
             })
             .await;
@@ -1378,13 +1444,22 @@ impl BuzzClient {
                     let status = resp.status();
                     if !status.is_success() {
                         let s = status.as_u16();
-                        let body = resp.text().await.unwrap_or_default();
+                        let body = read_response_text_limited(
+                            resp,
+                            MAX_ERROR_RESPONSE_BYTES,
+                            "upload error response",
+                        )
+                        .await?;
                         return Err(CliError::Relay { status: s, body });
                     }
-                    let descriptor = resp
-                        .json::<BlobDescriptor>()
-                        .await
-                        .map_err(CliError::from)?;
+                    let body = read_response_bytes_limited(
+                        resp,
+                        MAX_CONTROL_RESPONSE_BYTES,
+                        "upload descriptor",
+                    )
+                    .await?;
+                    let descriptor = serde_json::from_slice::<BlobDescriptor>(&body)
+                        .map_err(|e| CliError::Other(format!("invalid upload descriptor: {e}")))?;
                     validate_blob_descriptor(
                         descriptor,
                         &self.relay_url,
@@ -1433,13 +1508,22 @@ impl BuzzClient {
                     .await?;
                 if !resp.status().is_success() {
                     let status = resp.status().as_u16();
-                    let body = resp.text().await.unwrap_or_default();
+                    let body = read_response_text_limited(
+                        resp,
+                        MAX_ERROR_RESPONSE_BYTES,
+                        "legacy upload error response",
+                    )
+                    .await?;
                     return Err(CliError::Relay { status, body });
                 }
-                let descriptor = resp
-                    .json::<BlobDescriptor>()
-                    .await
-                    .map_err(CliError::from)?;
+                let body = read_response_bytes_limited(
+                    resp,
+                    MAX_CONTROL_RESPONSE_BYTES,
+                    "legacy upload descriptor",
+                )
+                .await?;
+                let descriptor = serde_json::from_slice::<BlobDescriptor>(&body)
+                    .map_err(|e| CliError::Other(format!("invalid upload descriptor: {e}")))?;
                 validate_blob_descriptor(
                     descriptor,
                     &self.relay_url,
@@ -1473,19 +1557,30 @@ impl BuzzClient {
                     .await?;
                 if !resp.status().is_success() {
                     let status = resp.status().as_u16();
-                    let body = resp.text().await.unwrap_or_default();
+                    let body = read_response_text_limited(
+                        resp,
+                        MAX_ERROR_RESPONSE_BYTES,
+                        "media download error response",
+                    )
+                    .await?;
                     return Err(CliError::Relay { status, body });
                 }
-                resp.bytes().await.map_err(CliError::Network)
+                read_response_bytes_limited(resp, MAX_VIDEO_BYTES as usize, "media download").await
             }
         })
         .await
     }
 
-    async fn handle_response(&self, resp: reqwest::Response) -> Result<String, CliError> {
+    async fn handle_response(
+        &self,
+        resp: reqwest::Response,
+        success_limit: usize,
+    ) -> Result<String, CliError> {
+        let status = resp.status().as_u16();
         if !resp.status().is_success() {
-            let status = resp.status().as_u16();
-            let body = resp.text().await.unwrap_or_default();
+            let body =
+                read_response_text_limited(resp, MAX_ERROR_RESPONSE_BYTES, "relay error response")
+                    .await?;
             let message = serde_json::from_str::<serde_json::Value>(&body)
                 .ok()
                 .and_then(|v| {
@@ -1509,7 +1604,7 @@ impl BuzzClient {
                 body: message,
             });
         }
-        Ok(resp.text().await?)
+        read_response_text_limited(resp, success_limit, "relay success response").await
     }
 }
 
@@ -1757,9 +1852,11 @@ mod retry_tests {
     use std::time::Duration;
 
     use super::{
-        env_duration_secs, is_moderation_kind, jitter_delay, parse_retry_hint_text,
-        parse_retry_in_secs, RETRY_BASE_SECS, RETRY_IN_MAX_SECS, RETRY_MAX_ATTEMPTS,
+        env_duration_secs, is_moderation_kind, is_stored_event_exhaustion_ambiguous, jitter_delay,
+        parse_retry_hint_text, parse_retry_in_secs, RETRY_BASE_SECS, RETRY_IN_MAX_SECS,
+        RETRY_MAX_ATTEMPTS,
     };
+    use crate::error::CliError;
 
     // ---- parse_retry_in_secs ----
 
@@ -1846,6 +1943,16 @@ mod retry_tests {
         }
     }
 
+    #[test]
+    fn oversized_stored_event_response_is_delivery_ambiguous() {
+        assert!(is_stored_event_exhaustion_ambiguous(
+            &CliError::ResponseTooLarge {
+                context: "event acknowledgement",
+                limit: 1,
+            }
+        ));
+    }
+
     // ---- jitter bounds ----
 
     #[test]
@@ -1916,7 +2023,95 @@ mod retry_policy_tests {
     use tokio::net::TcpListener;
 
     use super::super::error::CliError;
-    use super::BuzzClient;
+    use super::{read_response_bytes_limited, BuzzClient, MAX_CONTROL_RESPONSE_BYTES};
+
+    #[tokio::test]
+    async fn bounded_reader_rejects_chunked_body_after_crossing_limit() {
+        use tokio::io::AsyncWriteExt;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n3\r\nabc\r\n3\r\ndef\r\n0\r\n\r\n",
+                )
+                .await
+                .unwrap();
+        });
+
+        let response = reqwest::get(format!("http://{addr}")).await.unwrap();
+        let error = read_response_bytes_limited(response, 5, "test response")
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            CliError::ResponseTooLarge {
+                context: "test response",
+                limit: 5
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn bounded_reader_rejects_declared_oversize_before_reading_body() {
+        use tokio::io::AsyncWriteExt;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 6\r\n\r\n")
+                .await
+                .unwrap();
+        });
+
+        let response = reqwest::get(format!("http://{addr}")).await.unwrap();
+        assert!(matches!(
+            read_response_bytes_limited(response, 5, "declared response").await,
+            Err(CliError::ResponseTooLarge {
+                context: "declared response",
+                limit: 5
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn oversized_event_acknowledgement_is_delivery_unknown_without_retry() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let attempts = Arc::new(AtomicU32::new(0));
+        let server_attempts = attempts.clone();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                server_attempts.fetch_add(1, Ordering::SeqCst);
+                let mut request = [0_u8; 8192];
+                let _ = stream.read(&mut request).await;
+                let declared = MAX_CONTROL_RESPONSE_BYTES + 1;
+                stream
+                    .write_all(
+                        format!("HTTP/1.1 200 OK\r\ncontent-length: {declared}\r\n\r\n").as_bytes(),
+                    )
+                    .await
+                    .unwrap();
+            }
+        });
+
+        let client = test_client(&format!("http://{addr}"));
+        let event = make_stored_event(client.keys());
+        assert!(matches!(
+            client.submit_event(event).await,
+            Err(CliError::DeliveryUnknown(_))
+        ));
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+    }
 
     /// Spawn a one-shot axum server on a random port.  The handler `f` receives the
     /// attempt counter (incremented before every call) and returns a `(StatusCode,
