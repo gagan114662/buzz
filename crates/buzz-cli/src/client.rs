@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::future::Future;
 use std::time::Duration;
 
@@ -500,7 +501,7 @@ const QUERY_PAGE_SIZE: u32 = 500;
 fn advance_query_cursor(
     filter: &mut serde_json::Value,
     page: &[serde_json::Value],
-) -> Result<(), CliError> {
+) -> Result<(u64, String), CliError> {
     let last = page
         .last()
         .expect("a full query page always has a last event");
@@ -514,7 +515,46 @@ fn advance_query_cursor(
         .filter(|id| id.len() == 64 && id.chars().all(|c| c.is_ascii_hexdigit()))
         .ok_or_else(|| CliError::Other("query event missing valid id".into()))?;
     filter["until"] = serde_json::json!(created_at);
+    let id = id.to_ascii_lowercase();
     filter["before_id"] = serde_json::json!(id);
+    Ok((created_at, id))
+}
+
+fn validate_query_page(
+    page: &[serde_json::Value],
+    page_limit: usize,
+    seen_event_ids: &mut HashSet<String>,
+) -> Result<(), CliError> {
+    if page.len() > page_limit {
+        return Err(CliError::Other(format!(
+            "query returned {} events for a page limited to {page_limit}",
+            page.len()
+        )));
+    }
+    for event in page {
+        let id = event
+            .get("id")
+            .and_then(serde_json::Value::as_str)
+            .filter(|id| id.len() == 64 && id.chars().all(|c| c.is_ascii_hexdigit()))
+            .ok_or_else(|| CliError::Other("query event missing valid id".into()))?;
+        if !seen_event_ids.insert(id.to_ascii_lowercase()) {
+            return Err(CliError::Other(format!(
+                "query pagination repeated event {id}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn record_query_cursor(
+    seen_cursors: &mut HashSet<(u64, String)>,
+    cursor: (u64, String),
+) -> Result<(), CliError> {
+    if !seen_cursors.insert(cursor) {
+        return Err(CliError::Other(
+            "query pagination cursor did not advance".into(),
+        ));
+    }
     Ok(())
 }
 
@@ -686,6 +726,8 @@ impl BuzzClient {
         limit: Option<u32>,
     ) -> Result<Vec<serde_json::Value>, CliError> {
         let mut events = Vec::new();
+        let mut seen_event_ids = HashSet::new();
+        let mut seen_cursors = HashSet::new();
 
         while limit.is_none_or(|limit| events.len() < limit as usize) {
             let page_limit = limit
@@ -696,10 +738,12 @@ impl BuzzClient {
             let raw = self.query(&filter).await?;
             let page: Vec<serde_json::Value> = serde_json::from_str(&raw)
                 .map_err(|e| CliError::Other(format!("failed to parse query response: {e}")))?;
+            validate_query_page(&page, page_limit, &mut seen_event_ids)?;
             let done = page.len() < page_limit;
 
             if !done {
-                advance_query_cursor(&mut filter, &page)?;
+                let cursor = advance_query_cursor(&mut filter, &page)?;
+                record_query_cursor(&mut seen_cursors, cursor)?;
             }
             events.extend(page);
             if done {
@@ -2365,9 +2409,10 @@ mod retry_policy_tests {
 mod tests {
     use super::{
         advance_query_cursor, create_response_with_id_if_accepted, extract_relay_response_field,
-        validate_submit_event_response, BuzzClient,
+        record_query_cursor, validate_query_page, validate_submit_event_response, BuzzClient,
     };
     use nostr::{EventBuilder, Keys, Kind, Tag};
+    use std::collections::HashSet;
 
     #[test]
     fn query_cursor_uses_last_events_composite_sort_key() {
@@ -2395,6 +2440,27 @@ mod tests {
             &[serde_json::json!({"id": "not-an-event-id", "created_at": 10})]
         )
         .is_err());
+    }
+
+    #[test]
+    fn query_pages_reject_oversized_repeated_or_stalled_results() {
+        let event = |id: char| {
+            serde_json::json!({
+                "id": id.to_string().repeat(64),
+                "created_at": 10,
+            })
+        };
+        let mut seen_ids = HashSet::new();
+
+        assert!(validate_query_page(&[event('a'), event('b')], 1, &mut seen_ids).is_err());
+        assert!(seen_ids.is_empty());
+        assert!(validate_query_page(&[event('a')], 1, &mut seen_ids).is_ok());
+        assert!(validate_query_page(&[event('a')], 1, &mut seen_ids).is_err());
+
+        let mut seen_cursors = HashSet::new();
+        let cursor = (10, "a".repeat(64));
+        assert!(record_query_cursor(&mut seen_cursors, cursor.clone()).is_ok());
+        assert!(record_query_cursor(&mut seen_cursors, cursor).is_err());
     }
 
     #[test]
