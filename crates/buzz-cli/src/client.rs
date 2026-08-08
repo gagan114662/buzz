@@ -558,6 +558,19 @@ fn record_query_cursor(
     Ok(())
 }
 
+fn validate_query_response(raw: &str) -> Result<(), CliError> {
+    let events: Vec<nostr::Event> = serde_json::from_str(raw)
+        .map_err(|error| CliError::Other(format!("invalid relay query response: {error}")))?;
+    for (index, event) in events.iter().enumerate() {
+        event.verify().map_err(|error| {
+            CliError::Other(format!(
+                "relay query event at index {index} failed verification: {error}"
+            ))
+        })?;
+    }
+    Ok(())
+}
+
 pub struct BuzzClient {
     http: reqwest::Client,
     relay_url: String, // base URL, no trailing slash, e.g. "https://relay.buzz.place"
@@ -820,25 +833,28 @@ impl BuzzClient {
             serde_json::to_vec(filters)
                 .map_err(|e| CliError::Other(format!("filter serialization failed: {e}")))?,
         );
-        self.with_retry_body(|| {
-            let body = body.clone();
-            let url = url.clone();
-            async move {
-                let auth = sign_nip98(&self.keys, "POST", &url, Some(&body))?;
-                let resp = self
-                    .with_auth_tag(
-                        self.http
-                            .post(&url)
-                            .header("Authorization", auth)
-                            .header("Content-Type", "application/json")
-                            .body(body),
-                    )
-                    .send()
-                    .await?;
-                self.handle_response(resp).await
-            }
-        })
-        .await
+        let response = self
+            .with_retry_body(|| {
+                let body = body.clone();
+                let url = url.clone();
+                async move {
+                    let auth = sign_nip98(&self.keys, "POST", &url, Some(&body))?;
+                    let resp = self
+                        .with_auth_tag(
+                            self.http
+                                .post(&url)
+                                .header("Authorization", auth)
+                                .header("Content-Type", "application/json")
+                                .body(body),
+                        )
+                        .send()
+                        .await?;
+                    self.handle_response(resp).await
+                }
+            })
+            .await?;
+        validate_query_response(&response)?;
+        Ok(response)
     }
 
     /// Execute a one-shot count via the HTTP bridge.
@@ -2409,7 +2425,8 @@ mod retry_policy_tests {
 mod tests {
     use super::{
         advance_query_cursor, create_response_with_id_if_accepted, extract_relay_response_field,
-        record_query_cursor, validate_query_page, validate_submit_event_response, BuzzClient,
+        record_query_cursor, validate_query_page, validate_query_response,
+        validate_submit_event_response, BuzzClient,
     };
     use nostr::{EventBuilder, Keys, Kind, Tag};
     use std::collections::HashSet;
@@ -2461,6 +2478,22 @@ mod tests {
         let cursor = (10, "a".repeat(64));
         assert!(record_query_cursor(&mut seen_cursors, cursor.clone()).is_ok());
         assert!(record_query_cursor(&mut seen_cursors, cursor).is_err());
+    }
+
+    #[test]
+    fn query_response_requires_verified_nostr_events() {
+        let event = EventBuilder::new(Kind::TextNote, "authentic")
+            .sign_with_keys(&Keys::generate())
+            .unwrap();
+        let valid = serde_json::to_string(&vec![event.clone()]).unwrap();
+        assert!(validate_query_response(&valid).is_ok());
+        assert!(validate_query_response("[]").is_ok());
+        assert!(validate_query_response("{}").is_err());
+
+        let mut tampered = serde_json::to_value(event).unwrap();
+        tampered["content"] = serde_json::json!("changed after signing");
+        let tampered = serde_json::to_string(&vec![tampered]).unwrap();
+        assert!(validate_query_response(&tampered).is_err());
     }
 
     #[test]
