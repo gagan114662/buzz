@@ -26,6 +26,19 @@ use nostr::{EventBuilder, Tag};
 const GIT_ORIGIN_CHANNEL_ENV: &str = "BUZZ_GIT_ORIGIN_CHANNEL_ID";
 const GIT_ORIGIN_AGENT_ENV: &str = "BUZZ_GIT_ORIGIN_AGENT_NAME";
 
+/// Parse a relay query response as the event array promised by `/query`.
+///
+/// Read commands must not turn malformed or wrong-shaped relay data into an
+/// empty result: callers and agents need to distinguish "nothing matched"
+/// from "the relay response could not be trusted".
+pub(crate) fn parse_relay_event_array(
+    raw: &str,
+    operation: &str,
+) -> Result<Vec<serde_json::Value>, CliError> {
+    serde_json::from_str(raw)
+        .map_err(|error| CliError::Other(format!("invalid {operation} response: {error}")))
+}
+
 /// Add trusted, session-scoped provenance supplied by the ACP harness.
 ///
 /// Public channels use the standard NIP-29 `h` tag. Private conversations
@@ -137,5 +150,14 @@ mod tests {
             .tags
             .iter()
             .any(|tag| tag.as_slice().first().map(String::as_str) == Some("h")));
+    }
+
+    #[test]
+    fn relay_event_array_distinguishes_empty_from_invalid_data() {
+        assert!(parse_relay_event_array("[]", "message query")
+            .unwrap()
+            .is_empty());
+        assert!(parse_relay_event_array(r#"{"events":[]}"#, "message query").is_err());
+        assert!(parse_relay_event_array("not-json", "message query").is_err());
     }
 }

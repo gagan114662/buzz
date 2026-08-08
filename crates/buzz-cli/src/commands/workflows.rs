@@ -7,12 +7,9 @@ use crate::client::{
 use crate::error::CliError;
 use crate::validate::{parse_uuid, read_or_stdin, sdk_err, validate_uuid};
 
-// TODO(phase-4): Replace raw nostr::EventBuilder usage with buzz-sdk builder functions
+use super::parse_relay_event_array;
 
-fn parse_workflow_events(response: &str) -> Result<Vec<serde_json::Value>, CliError> {
-    serde_json::from_str(response)
-        .map_err(|error| CliError::Other(format!("invalid workflow query response: {error}")))
-}
+// TODO(phase-4): Replace raw nostr::EventBuilder usage with buzz-sdk builder functions
 
 /// List workflows in a channel — query kind:30620 workflow definition events.
 pub async fn cmd_list_workflows(client: &BuzzClient, channel_id: &str) -> Result<(), CliError> {
@@ -22,7 +19,7 @@ pub async fn cmd_list_workflows(client: &BuzzClient, channel_id: &str) -> Result
         "#h": [channel_id]
     });
     let resp = client.query(&filter).await?;
-    let events = parse_workflow_events(&resp)?;
+    let events = parse_relay_event_array(&resp, "workflow query")?;
     let workflows: Vec<serde_json::Value> = events
         .iter()
         .map(|e| {
@@ -48,7 +45,7 @@ pub async fn cmd_get_workflow(client: &BuzzClient, workflow_id: &str) -> Result<
         "#d": [workflow_id]
     });
     let resp = client.query(&filter).await?;
-    let events = parse_workflow_events(&resp)?;
+    let events = parse_relay_event_array(&resp, "workflow query")?;
     if let Some(e) = events.first() {
         let normalized = serde_json::json!({
             "workflow_id": extract_d_tag(e),
@@ -240,7 +237,7 @@ pub async fn dispatch(cmd: crate::WorkflowsCmd, client: &BuzzClient) -> Result<(
 
 #[cfg(test)]
 mod tests {
-    use super::{normalize_workflow_runs_response, parse_workflow_events, workflow_runs_path};
+    use super::{normalize_workflow_runs_response, workflow_runs_path};
 
     const WORKFLOW_ID: &str = "11111111-1111-4111-8111-111111111111";
 
@@ -274,12 +271,5 @@ mod tests {
     fn workflow_runs_response_rejects_non_array_or_malformed_json() {
         assert!(normalize_workflow_runs_response(r#"{"id":"run-1"}"#).is_err());
         assert!(normalize_workflow_runs_response("not-json").is_err());
-    }
-
-    #[test]
-    fn workflow_queries_distinguish_empty_results_from_invalid_relay_data() {
-        assert!(parse_workflow_events("[]").unwrap().is_empty());
-        assert!(parse_workflow_events(r#"{"events":[]}"#).is_err());
-        assert!(parse_workflow_events("not-json").is_err());
     }
 }
