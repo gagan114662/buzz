@@ -1214,12 +1214,13 @@ impl BuzzClient {
     /// All other event kinds retain the standard retry policy.
     pub async fn submit_event(&self, event: nostr::Event) -> Result<String, CliError> {
         let kind = event.kind.as_u16();
+        let expected_event_id = event.id.to_hex();
         let response = if is_moderation_kind(kind) {
             self.submit_moderation_event(event).await
         } else {
             self.submit_stored_event(event).await
         }?;
-        validate_submit_event_response(&response, kind)?;
+        validate_submit_event_response(&response, kind, &expected_event_id)?;
         Ok(response)
     }
 
@@ -1915,7 +1916,11 @@ pub fn normalize_write_response(raw: &str) -> String {
 /// A malformed 2xx body is not a safe retry signal: the relay may already have
 /// stored or executed the event. Surface an outcome-unknown error instead of
 /// letting commands exit zero with raw text or inventing missing fields.
-fn validate_submit_event_response(raw: &str, kind: u16) -> Result<(), CliError> {
+fn validate_submit_event_response(
+    raw: &str,
+    kind: u16,
+    expected_event_id: &str,
+) -> Result<(), CliError> {
     let invalid = |reason: &str| {
         CliError::DeliveryUnknown(format!(
             "event submission (kind {kind}) returned an invalid success response ({reason}); outcome unknown"
@@ -1926,12 +1931,19 @@ fn validate_submit_event_response(raw: &str, kind: u16) -> Result<(), CliError> 
     let response = response
         .as_object()
         .ok_or_else(|| invalid("not a JSON object"))?;
-    if response
+    let acknowledged_event_id = response
         .get("event_id")
         .and_then(serde_json::Value::as_str)
-        .is_none_or(str::is_empty)
+        .ok_or_else(|| invalid("missing string event_id"))?;
+    if acknowledged_event_id.len() != 64
+        || !acknowledged_event_id
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit())
     {
-        return Err(invalid("missing string event_id"));
+        return Err(invalid("event_id is not 64 hexadecimal characters"));
+    }
+    if acknowledged_event_id != expected_event_id {
+        return Err(invalid("event_id does not match submitted event"));
     }
     if response
         .get("accepted")
@@ -2367,7 +2379,10 @@ mod retry_policy_tests {
     /// cleanly distinguishes hint-honoured from jitter-fallback.
     #[tokio::test]
     async fn moderation_kind_ingest_429_is_retried_until_success() {
-        let (url, attempts) = test_server(|n| {
+        let keys = Keys::generate();
+        let event = make_moderation_event(&keys, 9041);
+        let expected_event_id = event.id.to_hex();
+        let (url, attempts) = test_server(move |n| {
             if n < 2 {
                 (
                     StatusCode::TOO_MANY_REQUESTS,
@@ -2379,13 +2394,12 @@ mod retry_policy_tests {
             } else {
                 (
                     StatusCode::OK,
-                    r#"{"event_id":"abc","accepted":true,"message":""}"#.to_string(),
+                    format!(r#"{{"event_id":"{expected_event_id}","accepted":true,"message":""}}"#),
                 )
             }
         })
         .await;
-        let client = test_client(&url);
-        let event = make_moderation_event(client.keys(), 9041);
+        let client = BuzzClient::new(url, keys, None, None).unwrap();
         let t0 = std::time::Instant::now();
         let result = client.submit_event(event).await;
         let elapsed = t0.elapsed();
@@ -2493,19 +2507,21 @@ mod retry_policy_tests {
     /// first attempt and then succeeds is retried under the standard policy.
     #[tokio::test]
     async fn stored_event_502_is_retried_under_standard_policy() {
-        let (url, attempts) = test_server(|n| {
+        let keys = Keys::generate();
+        let event = make_stored_event(&keys);
+        let expected_event_id = event.id.to_hex();
+        let (url, attempts) = test_server(move |n| {
             if n == 1 {
                 (StatusCode::BAD_GATEWAY, "transient".to_string())
             } else {
                 (
                     StatusCode::OK,
-                    r#"{"event_id":"abc","accepted":true,"message":""}"#.to_string(),
+                    format!(r#"{{"event_id":"{expected_event_id}","accepted":true,"message":""}}"#),
                 )
             }
         })
         .await;
-        let client = test_client(&url);
-        let event = make_stored_event(client.keys());
+        let client = BuzzClient::new(url, keys, None, None).unwrap();
         let result = client.submit_event(event).await;
         assert!(
             result.is_ok(),
@@ -2725,6 +2741,9 @@ mod retry_policy_tests {
         let bodies: Arc<std::sync::Mutex<Vec<Vec<u8>>>> =
             Arc::new(std::sync::Mutex::new(Vec::new()));
         let bodies2 = bodies.clone();
+        let keys = Keys::generate();
+        let event = make_stored_event(&keys);
+        let expected_event_id = event.id.to_hex();
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -2757,15 +2776,20 @@ mod retry_policy_tests {
                     let partial = b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 100\r\n\r\n{\"partial\":";
                     let _ = stream.write_all(partial).await;
                 } else {
-                    let ok = b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 47\r\n\r\n{\"event_id\":\"abc\",\"accepted\":true,\"message\":\"\"}";
-                    let _ = stream.write_all(ok).await;
+                    let body = format!(
+                        r#"{{"event_id":"{expected_event_id}","accepted":true,"message":""}}"#
+                    );
+                    let ok = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = stream.write_all(ok.as_bytes()).await;
                 }
             }
         });
 
         let base = format!("http://{addr}");
-        let client = test_client(&base);
-        let event = make_stored_event(client.keys());
+        let client = BuzzClient::new(base, keys, None, None).unwrap();
         let result = client.submit_event(event).await;
         assert!(
             result.is_ok(),
@@ -3231,20 +3255,43 @@ mod tests {
 
     #[test]
     fn submit_response_validation_preserves_explicit_duplicate_outcomes() {
+        let expected_event_id = "a".repeat(64);
         assert!(validate_submit_event_response(
-            r#"{"event_id":"abc","accepted":false,"message":"duplicate"}"#,
+            &format!(
+                r#"{{"event_id":"{expected_event_id}","accepted":false,"message":"duplicate"}}"#
+            ),
             9,
+            &expected_event_id,
         )
         .is_ok());
+        assert!(validate_submit_event_response(
+            &format!(r#"{{"event_id":"{expected_event_id}","accepted":true,"message":""}}"#),
+            9,
+            &expected_event_id,
+        )
+        .is_ok());
+        assert!(validate_submit_event_response("[]", 9, &expected_event_id).is_err());
+        assert!(validate_submit_event_response(
+            &format!(r#"{{"event_id":"{expected_event_id}","accepted":true}}"#),
+            9,
+            &expected_event_id,
+        )
+        .is_err());
         assert!(validate_submit_event_response(
             r#"{"event_id":"abc","accepted":true,"message":""}"#,
             9,
+            &expected_event_id,
         )
-        .is_ok());
-        assert!(validate_submit_event_response("[]", 9).is_err());
-        assert!(
-            validate_submit_event_response(r#"{"event_id":"abc","accepted":true}"#, 9,).is_err()
-        );
+        .is_err());
+        assert!(validate_submit_event_response(
+            &format!(
+                r#"{{"event_id":"{}","accepted":true,"message":""}}"#,
+                "b".repeat(64)
+            ),
+            9,
+            &expected_event_id,
+        )
+        .is_err());
     }
 
     // --- (a) auth-suppression regression pair ---
