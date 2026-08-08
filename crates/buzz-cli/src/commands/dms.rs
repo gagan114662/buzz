@@ -1,6 +1,8 @@
 use uuid::Uuid;
 
-use crate::client::{extract_d_tag, normalize_write_response, BuzzClient};
+use crate::client::{
+    create_response_with_id_if_accepted, extract_d_tag, normalize_write_response, BuzzClient,
+};
 use crate::error::CliError;
 use crate::validate::{parse_uuid, sdk_err, validate_hex64};
 
@@ -84,13 +86,10 @@ pub async fn cmd_open_dm(client: &BuzzClient, pubkeys: &[String]) -> Result<(), 
         .and_then(|v| v.get("channel_id")?.as_str().map(|s| s.to_string()));
     let final_dm_id = relay_dm_id.unwrap_or(dm_id);
 
-    let mut normalized: serde_json::Value =
-        serde_json::from_str(&resp).unwrap_or(serde_json::json!({}));
-    normalized["dm_id"] = serde_json::json!(final_dm_id);
-    if normalized.get("accepted").is_none() {
-        normalized["accepted"] = serde_json::json!(true);
-    }
-    println!("{normalized}");
+    println!(
+        "{}",
+        create_response_with_id_if_accepted(&resp, "dm_id", &final_dm_id)
+    );
     Ok(())
 }
 
