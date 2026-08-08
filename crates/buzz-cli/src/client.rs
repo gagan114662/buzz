@@ -862,11 +862,13 @@ impl BuzzClient {
     /// All other event kinds retain the standard retry policy.
     pub async fn submit_event(&self, event: nostr::Event) -> Result<String, CliError> {
         let kind = event.kind.as_u16();
-        if is_moderation_kind(kind) {
+        let response = if is_moderation_kind(kind) {
             self.submit_moderation_event(event).await
         } else {
             self.submit_stored_event(event).await
-        }
+        }?;
+        validate_submit_event_response(&response, kind)?;
+        Ok(response)
     }
 
     /// Submit a moderation command (kinds 9040–9044) with non-idempotent retry policy.
@@ -1437,6 +1439,47 @@ pub fn normalize_write_response(raw: &str) -> String {
     raw.to_string()
 }
 
+/// Validate the relay's successful `/events` response before any command can
+/// treat the write as a completed operation.
+///
+/// A malformed 2xx body is not a safe retry signal: the relay may already have
+/// stored or executed the event. Surface an outcome-unknown error instead of
+/// letting commands exit zero with raw text or inventing missing fields.
+fn validate_submit_event_response(raw: &str, kind: u16) -> Result<(), CliError> {
+    let invalid = |reason: &str| {
+        CliError::DeliveryUnknown(format!(
+            "event submission (kind {kind}) returned an invalid success response ({reason}); outcome unknown"
+        ))
+    };
+    let response: serde_json::Value =
+        serde_json::from_str(raw).map_err(|_| invalid("not valid JSON"))?;
+    let response = response
+        .as_object()
+        .ok_or_else(|| invalid("not a JSON object"))?;
+    if response
+        .get("event_id")
+        .and_then(serde_json::Value::as_str)
+        .is_none_or(str::is_empty)
+    {
+        return Err(invalid("missing string event_id"));
+    }
+    if response
+        .get("accepted")
+        .and_then(serde_json::Value::as_bool)
+        .is_none()
+    {
+        return Err(invalid("missing boolean accepted"));
+    }
+    if response
+        .get("message")
+        .and_then(serde_json::Value::as_str)
+        .is_none()
+    {
+        return Err(invalid("missing string message"));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod retry_tests {
     use std::time::Duration;
@@ -1656,6 +1699,24 @@ mod retry_policy_tests {
         EventBuilder::new(Kind::TextNote, "hi")
             .sign_with_keys(keys)
             .unwrap()
+    }
+
+    #[tokio::test]
+    async fn stored_event_invalid_success_response_is_delivery_unknown_without_retry() {
+        let (url, attempts) = test_server(|_n| {
+            (
+                StatusCode::OK,
+                r#"{"event_id":"abc","message":"stored"}"#.to_string(),
+            )
+        })
+        .await;
+        let client = test_client(&url);
+        let event = make_stored_event(client.keys());
+
+        let err = client.submit_event(event).await.unwrap_err();
+
+        assert!(matches!(err, CliError::DeliveryUnknown(_)));
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
     }
 
     /// A moderation command (kind 9040) that fails the first attempt with HTTP 429
@@ -2083,7 +2144,7 @@ mod retry_policy_tests {
                     let partial = b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 100\r\n\r\n{\"partial\":";
                     let _ = stream.write_all(partial).await;
                 } else {
-                    let ok = b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 41\r\n\r\n{\"event_id\":\"abc\",\"accepted\":true,\"message\":\"\"}";
+                    let ok = b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 47\r\n\r\n{\"event_id\":\"abc\",\"accepted\":true,\"message\":\"\"}";
                     let _ = stream.write_all(ok).await;
                 }
             }
@@ -2304,7 +2365,7 @@ mod retry_policy_tests {
 mod tests {
     use super::{
         advance_query_cursor, create_response_with_id_if_accepted, extract_relay_response_field,
-        BuzzClient,
+        validate_submit_event_response, BuzzClient,
     };
     use nostr::{EventBuilder, Keys, Kind, Tag};
 
@@ -2374,6 +2435,24 @@ mod tests {
             "link field must be absent on rejected create"
         );
         assert_eq!(v["accepted"].as_bool(), Some(false));
+    }
+
+    #[test]
+    fn submit_response_validation_preserves_explicit_duplicate_outcomes() {
+        assert!(validate_submit_event_response(
+            r#"{"event_id":"abc","accepted":false,"message":"duplicate"}"#,
+            9,
+        )
+        .is_ok());
+        assert!(validate_submit_event_response(
+            r#"{"event_id":"abc","accepted":true,"message":""}"#,
+            9,
+        )
+        .is_ok());
+        assert!(validate_submit_event_response("[]", 9).is_err());
+        assert!(
+            validate_submit_event_response(r#"{"event_id":"abc","accepted":true}"#, 9,).is_err()
+        );
     }
 
     // --- (a) auth-suppression regression pair ---
