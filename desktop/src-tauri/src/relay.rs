@@ -9,6 +9,8 @@ use sha2::{Digest, Sha256};
 
 use crate::app_state::AppState;
 
+pub mod http;
+
 const DEFAULT_RELAY_WS_URL: &str = "ws://localhost:3000";
 
 // A reached-but-malformed 2xx body is NOT a connectivity failure, so this
@@ -307,32 +309,6 @@ pub async fn query_relay(
     filters: &[serde_json::Value],
 ) -> Result<Vec<nostr::Event>, String> {
     query_relay_at(state, &relay_api_base_url_with_override(state), filters).await
-}
-
-/// Execute an authenticated GET against the active relay and decode JSON.
-pub async fn get_relay_json<T: DeserializeOwned>(
-    state: &AppState,
-    path_with_query: &str,
-) -> Result<T, String> {
-    crate::relay_admission::wait_for_rate_limit().await;
-    let path = if path_with_query.starts_with('/') {
-        path_with_query.to_string()
-    } else {
-        format!("/{path_with_query}")
-    };
-    let url = format!("{}{}", relay_api_base_url_with_override(state), path);
-    let auth = build_nip98_auth_header(&Method::GET, &url, &[], state)?;
-    let response = state
-        .http_client
-        .get(&url)
-        .header("Authorization", auth)
-        .send()
-        .await
-        .map_err(|error| classify_request_error(&error))?;
-    if !response.status().is_success() {
-        return Err(relay_error_message(response).await);
-    }
-    parse_json_response(response).await
 }
 
 /// Like [`query_relay`] but targets an explicit HTTP API base URL instead of

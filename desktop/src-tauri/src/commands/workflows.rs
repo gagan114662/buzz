@@ -5,7 +5,7 @@ use tauri::State;
 use crate::{
     app_state::AppState,
     events,
-    relay::{get_relay_json, parse_command_response, query_relay, submit_event},
+    relay::{http::get_relay_json, parse_command_response, query_relay, submit_event},
 };
 
 // ── Wire shapes (snake_case, consumed by tauriWorkflows.ts) ──────────────────
