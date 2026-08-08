@@ -7,7 +7,7 @@ use crate::client::{
 use crate::error::CliError;
 use crate::validate::{parse_uuid, read_or_stdin, sdk_err, validate_uuid};
 
-use super::parse_relay_event_array;
+use super::parse_json_array_response;
 
 // TODO(phase-4): Replace raw nostr::EventBuilder usage with buzz-sdk builder functions
 
@@ -19,7 +19,7 @@ pub async fn cmd_list_workflows(client: &BuzzClient, channel_id: &str) -> Result
         "#h": [channel_id]
     });
     let resp = client.query(&filter).await?;
-    let events = parse_relay_event_array(&resp, "workflow query")?;
+    let events = parse_json_array_response(&resp, "workflow query")?;
     let workflows: Vec<serde_json::Value> = events
         .iter()
         .map(|e| {
@@ -45,7 +45,7 @@ pub async fn cmd_get_workflow(client: &BuzzClient, workflow_id: &str) -> Result<
         "#d": [workflow_id]
     });
     let resp = client.query(&filter).await?;
-    let events = parse_relay_event_array(&resp, "workflow query")?;
+    let events = parse_json_array_response(&resp, "workflow query")?;
     if let Some(e) = events.first() {
         let normalized = serde_json::json!({
             "workflow_id": extract_d_tag(e),

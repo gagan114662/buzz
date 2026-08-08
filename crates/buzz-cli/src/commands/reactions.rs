@@ -6,7 +6,7 @@ use crate::client::{normalize_write_response, BuzzClient};
 use crate::error::CliError;
 use crate::validate::validate_hex64;
 
-use super::parse_relay_event_array;
+use super::parse_json_array_response;
 
 pub async fn cmd_add_reaction(
     client: &BuzzClient,
@@ -86,7 +86,7 @@ pub async fn cmd_get_reactions(client: &BuzzClient, event_id: &str) -> Result<()
         "#e": [event_id]
     });
     let resp = client.query(&filter).await?;
-    let events = parse_relay_event_array(&resp, "reactions query")?;
+    let events = parse_json_array_response(&resp, "reactions query")?;
 
     let mut groups: HashMap<String, Vec<String>> = HashMap::new();
     for e in &events {

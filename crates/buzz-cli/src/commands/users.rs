@@ -5,7 +5,7 @@ use crate::client::{extract_d_tag, normalize_write_response, BuzzClient};
 use crate::error::CliError;
 use crate::validate::validate_hex64;
 
-use super::parse_relay_event_array;
+use super::parse_json_array_response;
 
 /// Get user profiles (kind:0 metadata events).
 ///
@@ -52,7 +52,7 @@ pub async fn cmd_get_users(
         "limit": authors.len()
     });
     let resp = client.query(&filter).await?;
-    let events = parse_relay_event_array(&resp, "user profile query")?;
+    let events = parse_json_array_response(&resp, "user profile query")?;
     let profiles: Vec<serde_json::Value> = events
         .iter()
         .filter_map(|e| {
@@ -434,7 +434,7 @@ async fn fetch_current_profile(
         "limit": 1
     });
     let raw = client.query(&filter).await?;
-    let events = parse_relay_event_array(&raw, "current profile query")?;
+    let events = parse_json_array_response(&raw, "current profile query")?;
     parse_current_profile(&events)
 }
 
@@ -474,7 +474,7 @@ pub async fn cmd_get_presence(client: &BuzzClient, pubkeys_csv: &str) -> Result<
         "limit": pubkeys.len()
     });
     let resp = client.query(&filter).await?;
-    let events = parse_relay_event_array(&resp, "presence query")?;
+    let events = parse_json_array_response(&resp, "presence query")?;
     let presence: Vec<serde_json::Value> = events
         .iter()
         .map(|e| {

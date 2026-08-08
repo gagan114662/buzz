@@ -6,7 +6,7 @@ use crate::client::{
 use crate::error::CliError;
 use crate::validate::{parse_uuid, sdk_err, validate_hex64};
 
-use super::parse_relay_event_array;
+use super::parse_json_array_response;
 
 /// List DM conversations by querying kind:41001 (relay-confirmed DMs) filtered by our pubkey.
 pub async fn cmd_list_dms(client: &BuzzClient, limit: Option<u32>) -> Result<(), CliError> {
@@ -18,7 +18,7 @@ pub async fn cmd_list_dms(client: &BuzzClient, limit: Option<u32>) -> Result<(),
         "limit": limit
     });
     let resp = client.query(&filter).await?;
-    let events = parse_relay_event_array(&resp, "DM list query")?;
+    let events = parse_json_array_response(&resp, "DM list query")?;
     let dms: Vec<serde_json::Value> = events
         .iter()
         .map(|e| {

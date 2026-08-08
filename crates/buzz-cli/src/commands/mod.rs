@@ -26,12 +26,12 @@ use nostr::{EventBuilder, Tag};
 const GIT_ORIGIN_CHANNEL_ENV: &str = "BUZZ_GIT_ORIGIN_CHANNEL_ID";
 const GIT_ORIGIN_AGENT_ENV: &str = "BUZZ_GIT_ORIGIN_AGENT_NAME";
 
-/// Parse a relay query response as the event array promised by `/query`.
+/// Parse a JSON response whose endpoint contract promises a top-level array.
 ///
-/// Read commands must not turn malformed or wrong-shaped relay data into an
+/// Read commands must not turn malformed or wrong-shaped service data into an
 /// empty result: callers and agents need to distinguish "nothing matched"
-/// from "the relay response could not be trusted".
-pub(crate) fn parse_relay_event_array(
+/// from "the response could not be trusted".
+pub(crate) fn parse_json_array_response(
     raw: &str,
     operation: &str,
 ) -> Result<Vec<serde_json::Value>, CliError> {
@@ -153,11 +153,11 @@ mod tests {
     }
 
     #[test]
-    fn relay_event_array_distinguishes_empty_from_invalid_data() {
-        assert!(parse_relay_event_array("[]", "message query")
+    fn json_array_response_distinguishes_empty_from_invalid_data() {
+        assert!(parse_json_array_response("[]", "message query")
             .unwrap()
             .is_empty());
-        assert!(parse_relay_event_array(r#"{"events":[]}"#, "message query").is_err());
-        assert!(parse_relay_event_array("not-json", "message query").is_err());
+        assert!(parse_json_array_response(r#"{"events":[]}"#, "message query").is_err());
+        assert!(parse_json_array_response("not-json", "message query").is_err());
     }
 }

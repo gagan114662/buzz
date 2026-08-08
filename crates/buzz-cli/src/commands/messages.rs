@@ -12,7 +12,7 @@ use buzz_sdk::mentions::{
     extract_at_mentions_with_known, extract_nostr_uris, strip_code_regions, MENTION_CAP,
 };
 
-use super::parse_relay_event_array;
+use super::parse_json_array_response;
 
 /// Extract the thread root event ID from a Nostr tag array.
 ///
@@ -386,7 +386,7 @@ pub async fn cmd_get_messages(
     }
 
     let resp = client.query(&filter).await?;
-    let mut events = parse_relay_event_array(&resp, "messages query")?;
+    let mut events = parse_json_array_response(&resp, "messages query")?;
     events.sort_by_key(|e| e.get("created_at").and_then(|v| v.as_u64()).unwrap_or(0));
     let normalized = normalize_events(&events);
     println!("{}", format_events(&normalized, format));
@@ -422,7 +422,7 @@ pub async fn cmd_get_thread(
         "limit": 1
     });
     let resp = client.query_multi(&[reply_filter, root_filter]).await?;
-    let mut events = parse_relay_event_array(&resp, "thread query")?;
+    let mut events = parse_json_array_response(&resp, "thread query")?;
     events.sort_by_key(|e| e.get("created_at").and_then(|v| v.as_u64()).unwrap_or(0));
     let normalized = normalize_events(&events);
     println!("{}", format_events(&normalized, format));
@@ -463,7 +463,7 @@ pub async fn cmd_search(
         filter["since"] = serde_json::json!(s);
     }
     let resp = client.query(&filter).await?;
-    let mut events = parse_relay_event_array(&resp, "message search")?;
+    let mut events = parse_json_array_response(&resp, "message search")?;
     // The full-text path returns relevance order; a pure author/time query has
     // no relevance, so present newest-first like `messages get`.
     if query.is_none() {
@@ -501,7 +501,7 @@ async fn resolve_author(client: &BuzzClient, author: &str) -> Result<String, Cli
         "limit": 100
     });
     let raw = client.query(&filter).await?;
-    let events = parse_relay_event_array(&raw, "author profile query")?;
+    let events = parse_json_array_response(&raw, "author profile query")?;
     let mut matches = match_profiles_by_name(&events, author);
     match matches.len() {
         0 => Err(CliError::Usage(format!(

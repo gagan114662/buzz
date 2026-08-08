@@ -3,7 +3,7 @@ use std::cmp::Reverse;
 use crate::client::{normalize_events, BuzzClient};
 use crate::error::CliError;
 
-use super::parse_relay_event_array;
+use super::parse_json_array_response;
 
 const VALID_FEED_TYPES: &[&str] = &["mentions", "needs_action", "activity", "agent_activity"];
 
@@ -41,7 +41,7 @@ pub async fn cmd_get_feed(
     }
 
     let resp = client.query(&filter).await?;
-    let mut events = parse_relay_event_array(&resp, "feed query")?;
+    let mut events = parse_json_array_response(&resp, "feed query")?;
     events.sort_by_key(|e| Reverse(e.get("created_at").and_then(|v| v.as_u64()).unwrap_or(0)));
     let normalized = normalize_events(&events);
     let output = match format {

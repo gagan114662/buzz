@@ -21,6 +21,14 @@ use crate::error::CliError;
 use crate::validate::validate_hex64;
 use crate::{ModerationCmd, OutputFormat};
 
+use super::parse_json_array_response;
+
+fn normalize_moderation_rows(raw: &str, operation: &str) -> Result<String, CliError> {
+    let rows = parse_json_array_response(raw, operation)?;
+    serde_json::to_string(&rows)
+        .map_err(|error| CliError::Other(format!("failed to serialize {operation}: {error}")))
+}
+
 /// Resolve `--expires-in <secs>` / `--expires-at <unix>` into an absolute
 /// unix-seconds expiry. At most one may be set (enforced by clap).
 fn resolve_expiry(expires_in: Option<u64>, expires_at: Option<u64>) -> Option<u64> {
@@ -112,13 +120,19 @@ async fn cmd_reports(
         path.push_str(&format!("&status={s}"));
     }
     let resp = client.get_authed(&path).await?;
-    println!("{resp}");
+    println!(
+        "{}",
+        normalize_moderation_rows(&resp, "moderation reports")?
+    );
     Ok(())
 }
 
 async fn cmd_restricted(client: &BuzzClient) -> Result<(), CliError> {
     let resp = client.get_authed("/moderation/restricted").await?;
-    println!("{resp}");
+    println!(
+        "{}",
+        normalize_moderation_rows(&resp, "moderation restrictions")?
+    );
     Ok(())
 }
 
@@ -126,8 +140,23 @@ async fn cmd_audit(client: &BuzzClient, limit: i64) -> Result<(), CliError> {
     let resp = client
         .get_authed(&format!("/moderation/audit?limit={limit}"))
         .await?;
-    println!("{resp}");
+    println!("{}", normalize_moderation_rows(&resp, "moderation audit")?);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::normalize_moderation_rows;
+
+    #[test]
+    fn moderation_reads_reject_malformed_or_wrong_shaped_success_bodies() {
+        assert_eq!(
+            normalize_moderation_rows("[]", "moderation audit").unwrap(),
+            "[]"
+        );
+        assert!(normalize_moderation_rows("{}", "moderation audit").is_err());
+        assert!(normalize_moderation_rows("not-json", "moderation audit").is_err());
+    }
 }
 
 pub async fn dispatch(
