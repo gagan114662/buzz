@@ -102,10 +102,31 @@ pub async fn cmd_create_workflow(
     let event = client.sign_event(builder)?;
 
     let resp = client.submit_event(event).await?;
-    let final_workflow_id = extract_relay_response_field(&resp, "workflow_id")
-        .unwrap_or_else(|| workflow_id.to_string());
+    let final_workflow_id = validate_workflow_create_response(&resp, workflow_id)?;
     print_create_response(&resp, "workflow_id", &final_workflow_id);
     Ok(())
+}
+
+fn validate_workflow_create_response(
+    resp: &str,
+    expected_workflow_id: uuid::Uuid,
+) -> Result<String, CliError> {
+    let workflow_id = extract_relay_response_field(resp, "workflow_id").ok_or_else(|| {
+        CliError::DeliveryUnknown(
+            "workflow creation succeeded without a canonical workflow_id; outcome unknown".into(),
+        )
+    })?;
+    let parsed = parse_uuid(&workflow_id).map_err(|_| {
+        CliError::DeliveryUnknown(
+            "workflow creation returned an invalid canonical workflow_id; outcome unknown".into(),
+        )
+    })?;
+    if parsed != expected_workflow_id {
+        return Err(CliError::DeliveryUnknown(
+            "workflow creation returned a different workflow_id; outcome unknown".into(),
+        ));
+    }
+    Ok(workflow_id)
 }
 
 /// Update a workflow — sign and submit an updated kind:30620 event with same d-tag.
@@ -237,7 +258,9 @@ pub async fn dispatch(cmd: crate::WorkflowsCmd, client: &BuzzClient) -> Result<(
 
 #[cfg(test)]
 mod tests {
-    use super::{normalize_workflow_runs_response, workflow_runs_path};
+    use super::{
+        normalize_workflow_runs_response, validate_workflow_create_response, workflow_runs_path,
+    };
 
     const WORKFLOW_ID: &str = "11111111-1111-4111-8111-111111111111";
 
@@ -271,5 +294,23 @@ mod tests {
     fn workflow_runs_response_rejects_non_array_or_malformed_json() {
         assert!(normalize_workflow_runs_response(r#"{"id":"run-1"}"#).is_err());
         assert!(normalize_workflow_runs_response("not-json").is_err());
+    }
+
+    #[test]
+    fn workflow_create_receipt_must_match_the_submitted_workflow_id() {
+        let expected = uuid::Uuid::parse_str(WORKFLOW_ID).unwrap();
+        let valid = format!(r#"{{"message":"response:{{\"workflow_id\":\"{WORKFLOW_ID}\"}}"}}"#);
+        assert_eq!(
+            validate_workflow_create_response(&valid, expected).unwrap(),
+            WORKFLOW_ID
+        );
+
+        for invalid in [
+            r#"{"message":"duplicate: already processed"}"#,
+            r#"{"message":"response:{\"workflow_id\":\"not-a-uuid\"}"}"#,
+            r#"{"message":"response:{\"workflow_id\":\"22222222-2222-4222-8222-222222222222\"}"}"#,
+        ] {
+            assert!(validate_workflow_create_response(invalid, expected).is_err());
+        }
     }
 }

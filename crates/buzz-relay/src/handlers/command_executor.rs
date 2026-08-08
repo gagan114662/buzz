@@ -768,10 +768,17 @@ async fn handle_workflow_def(
     // Persist the command event — returns open transaction
     let tx = match persist_command_event(state, tenant, event, None).await? {
         PersistResult::Duplicate => {
+            let recovered_secret = if matches!(def.trigger, buzz_workflow::TriggerDef::Webhook) {
+                existing_workflow
+                    .as_ref()
+                    .and_then(|workflow| webhook_secret::extract_secret(&workflow.definition))
+            } else {
+                None
+            };
             return Ok(IngestResult {
                 event_id: event.id.to_hex(),
                 accepted: true,
-                message: "duplicate: already processed".into(),
+                message: workflow_def_response_message(workflow_id, recovered_secret.as_deref()),
             });
         }
         PersistResult::Inserted(tx) => tx,
@@ -826,18 +833,21 @@ async fn handle_workflow_def(
         .map_err(|e| IngestError::Internal(format!("error: commit transaction: {e}")))?;
 
     // 5. Return response
-    let mut resp = serde_json::json!({
-        "workflow_id": workflow_id.to_string(),
-    });
-    if let Some(secret) = webhook_secret {
-        resp["webhook_secret"] = serde_json::Value::String(secret);
-    }
-
     Ok(IngestResult {
         event_id: event.id.to_hex(),
         accepted: true,
-        message: format!("response:{}", resp),
+        message: workflow_def_response_message(workflow_id, webhook_secret.as_deref()),
     })
+}
+
+fn workflow_def_response_message(workflow_id: Uuid, webhook_secret: Option<&str>) -> String {
+    let mut response = serde_json::json!({
+        "workflow_id": workflow_id.to_string(),
+    });
+    if let Some(secret) = webhook_secret {
+        response["webhook_secret"] = serde_json::Value::String(secret.to_owned());
+    }
+    format!("response:{response}")
 }
 
 async fn handle_workflow_trigger(
@@ -1467,6 +1477,21 @@ mod tests {
             assert_eq!(payload["channel_id"], channel_id.to_string());
             assert_eq!(payload["created"], created);
         }
+    }
+
+    #[test]
+    fn workflow_definition_receipt_can_recover_the_original_webhook_secret() {
+        let workflow_id = Uuid::parse_str("22222222-2222-2222-2222-222222222222").unwrap();
+        let message = workflow_def_response_message(workflow_id, Some("same-secret"));
+        let payload: serde_json::Value =
+            serde_json::from_str(message.strip_prefix("response:").unwrap()).unwrap();
+        assert_eq!(payload["workflow_id"], workflow_id.to_string());
+        assert_eq!(payload["webhook_secret"], "same-secret");
+
+        let message = workflow_def_response_message(workflow_id, None);
+        let payload: serde_json::Value =
+            serde_json::from_str(message.strip_prefix("response:").unwrap()).unwrap();
+        assert!(payload.get("webhook_secret").is_none());
     }
 
     #[test]
