@@ -74,23 +74,33 @@ pub async fn cmd_open_dm(client: &BuzzClient, pubkeys: &[String]) -> Result<(), 
     let event = client.sign_event(builder)?;
 
     let resp = client.submit_event(event).await?;
-    // Try to extract relay-assigned channel_id from response message.
-    // Relay returns: {"event_id":"...","accepted":true,"message":"response:{\"channel_id\":\"...\",\"created\":true}"}
-    let relay_dm_id = serde_json::from_str::<serde_json::Value>(&resp)
-        .ok()
-        .and_then(|v| v.get("message")?.as_str().map(|s| s.to_string()))
-        .and_then(|msg| {
-            let json_part = msg.strip_prefix("response:")?;
-            serde_json::from_str::<serde_json::Value>(json_part).ok()
-        })
-        .and_then(|v| v.get("channel_id")?.as_str().map(|s| s.to_string()));
-    let final_dm_id = relay_dm_id.unwrap_or(dm_id);
+    let final_dm_id = extract_dm_channel_id(&resp)?;
 
     println!(
         "{}",
         create_response_with_id_if_accepted(&resp, "dm_id", &final_dm_id)
     );
     Ok(())
+}
+
+fn extract_dm_channel_id(resp: &str) -> Result<String, CliError> {
+    let channel_id = serde_json::from_str::<serde_json::Value>(resp)
+        .ok()
+        .and_then(|value| value.get("message")?.as_str().map(str::to_owned))
+        .and_then(|message| message.strip_prefix("response:").map(str::to_owned))
+        .and_then(|payload| serde_json::from_str::<serde_json::Value>(&payload).ok())
+        .and_then(|value| value.get("channel_id")?.as_str().map(str::to_owned))
+        .ok_or_else(|| {
+            CliError::DeliveryUnknown(
+                "DM open succeeded without a canonical channel_id; outcome unknown".into(),
+            )
+        })?;
+    parse_uuid(&channel_id).map_err(|_| {
+        CliError::DeliveryUnknown(
+            "DM open returned an invalid canonical channel_id; outcome unknown".into(),
+        )
+    })?;
+    Ok(channel_id)
 }
 
 /// Hide a DM channel — sign and submit a kind:41012 event with h-tag.
@@ -133,5 +143,28 @@ pub async fn dispatch(cmd: crate::DmsCmd, client: &BuzzClient) -> Result<(), Cli
         DmsCmd::Open { pubkeys } => cmd_open_dm(client, &pubkeys).await,
         DmsCmd::AddMember { channel, pubkey } => cmd_add_dm_member(client, &channel, &pubkey).await,
         DmsCmd::Hide { channel } => cmd_hide_dm(client, &channel).await,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::extract_dm_channel_id;
+
+    #[test]
+    fn dm_open_requires_a_canonical_uuid_receipt() {
+        let channel_id = "11111111-1111-1111-1111-111111111111";
+        let valid = format!(
+            r#"{{"event_id":"{}","accepted":true,"message":"response:{{\"channel_id\":\"{channel_id}\",\"created\":false}}"}}"#,
+            "a".repeat(64)
+        );
+        assert_eq!(extract_dm_channel_id(&valid).unwrap(), channel_id);
+
+        for invalid in [
+            r#"{"message":"duplicate: already processed"}"#,
+            r#"{"message":"response:{\"created\":true}"}"#,
+            r#"{"message":"response:{\"channel_id\":\"not-a-uuid\"}"}"#,
+        ] {
+            assert!(extract_dm_channel_id(invalid).is_err());
+        }
     }
 }

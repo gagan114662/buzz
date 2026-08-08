@@ -348,10 +348,22 @@ async fn handle_dm_open(
     // Persist the command event (idempotency) — returns open transaction
     let tx = match persist_command_event(state, tenant, event, None).await? {
         PersistResult::Duplicate => {
+            let all_refs: Vec<&[u8]> = all_bytes.iter().map(Vec::as_slice).collect();
+            let participant_hash = buzz_db::dm::compute_participant_hash(&all_refs);
+            let channel = state
+                .db
+                .find_dm_by_participants(tenant.community(), &participant_hash)
+                .await
+                .map_err(|e| IngestError::Internal(format!("error: db find_dm: {e}")))?
+                .ok_or_else(|| {
+                    IngestError::Internal(
+                        "error: processed DM event has no matching conversation".into(),
+                    )
+                })?;
             return Ok(IngestResult {
                 event_id: event.id.to_hex(),
                 accepted: true,
-                message: "duplicate: already processed".into(),
+                message: dm_open_response_message(channel.id, false),
             });
         }
         PersistResult::Inserted(tx) => tx,
@@ -430,14 +442,18 @@ async fn handle_dm_open(
     Ok(IngestResult {
         event_id: event.id.to_hex(),
         accepted: true,
-        message: format!(
-            "response:{}",
-            serde_json::json!({
-                "channel_id": channel.id.to_string(),
-                "created": was_created,
-            })
-        ),
+        message: dm_open_response_message(channel.id, was_created),
     })
+}
+
+fn dm_open_response_message(channel_id: Uuid, created: bool) -> String {
+    format!(
+        "response:{}",
+        serde_json::json!({
+            "channel_id": channel_id.to_string(),
+            "created": created,
+        })
+    )
 }
 
 async fn handle_dm_add_member(
@@ -1439,6 +1455,18 @@ mod tests {
         assert_eq!(payload["status"], "granted");
         assert_eq!(payload["run_id"], run_id.to_string());
         assert_eq!(payload["workflow_id"], workflow_id.to_string());
+    }
+
+    #[test]
+    fn dm_open_response_message_always_carries_the_canonical_channel_id() {
+        let channel_id = Uuid::parse_str("11111111-1111-1111-1111-111111111111").unwrap();
+        for created in [true, false] {
+            let message = dm_open_response_message(channel_id, created);
+            let payload: serde_json::Value =
+                serde_json::from_str(message.strip_prefix("response:").unwrap()).unwrap();
+            assert_eq!(payload["channel_id"], channel_id.to_string());
+            assert_eq!(payload["created"], created);
+        }
     }
 
     #[test]
