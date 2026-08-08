@@ -149,6 +149,29 @@ pub async fn cmd_update_workflow(
     Ok(())
 }
 
+fn validate_approval_action_response(
+    resp: &str,
+    expected_token_hash: &str,
+    expected_status: &str,
+) -> Result<(), CliError> {
+    let token = extract_relay_response_field(resp, "token");
+    let status = extract_relay_response_field(resp, "status");
+    let run_id = extract_relay_response_field(resp, "run_id");
+    let workflow_id = extract_relay_response_field(resp, "workflow_id");
+    if token.as_deref() != Some(expected_token_hash)
+        || status.as_deref() != Some(expected_status)
+        || run_id.as_deref().is_none_or(|id| parse_uuid(id).is_err())
+        || workflow_id
+            .as_deref()
+            .is_none_or(|id| parse_uuid(id).is_err())
+    {
+        return Err(CliError::DeliveryUnknown(
+            "workflow approval returned an invalid or mismatched receipt; outcome unknown".into(),
+        ));
+    }
+    Ok(())
+}
+
 /// Delete a workflow — sign and submit a kind:5 deletion event.
 pub async fn cmd_delete_workflow(client: &BuzzClient, workflow_id: &str) -> Result<(), CliError> {
     let wf_uuid = parse_uuid(workflow_id)?;
@@ -241,6 +264,11 @@ pub async fn cmd_approve_step(
     let event = client.sign_event(builder)?;
 
     let resp = client.submit_event(event).await?;
+    validate_approval_action_response(
+        &resp,
+        &token_hash,
+        if approved { "granted" } else { "denied" },
+    )?;
     println!("{}", normalize_write_response(&resp));
     Ok(())
 }
@@ -279,8 +307,8 @@ pub async fn dispatch(cmd: crate::WorkflowsCmd, client: &BuzzClient) -> Result<(
 #[cfg(test)]
 mod tests {
     use super::{
-        normalize_workflow_runs_response, validate_workflow_create_response,
-        validate_workflow_trigger_response, workflow_runs_path,
+        normalize_workflow_runs_response, validate_approval_action_response,
+        validate_workflow_create_response, validate_workflow_trigger_response, workflow_runs_path,
     };
 
     const WORKFLOW_ID: &str = "11111111-1111-4111-8111-111111111111";
@@ -347,5 +375,22 @@ mod tests {
         ] {
             assert!(validate_workflow_trigger_response(invalid).is_err());
         }
+    }
+
+    #[test]
+    fn workflow_approval_receipt_is_bound_to_action_and_canonical_ids() {
+        let token = "a".repeat(64);
+        let valid = format!(
+            r#"{{"message":"response:{{\"token\":\"{token}\",\"status\":\"granted\",\"run_id\":\"33333333-3333-4333-8333-333333333333\",\"workflow_id\":\"11111111-1111-4111-8111-111111111111\"}}"}}"#
+        );
+        assert!(validate_approval_action_response(&valid, &token, "granted").is_ok());
+        assert!(validate_approval_action_response(&valid, &token, "denied").is_err());
+        assert!(validate_approval_action_response(&valid, &"b".repeat(64), "granted").is_err());
+        assert!(validate_approval_action_response(
+            r#"{"message":"duplicate: already processed"}"#,
+            &token,
+            "granted",
+        )
+        .is_err());
     }
 }

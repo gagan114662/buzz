@@ -1119,6 +1119,38 @@ async fn handle_approval_grant(
         .await
         .map_err(|_| IngestError::Rejected("invalid: approval not found".into()))?;
 
+    // Recover the authoritative receipt for an exact retry before rejecting
+    // the approval's now-terminal state.
+    let mut tx = match persist_command_event(state, tenant, event, None).await? {
+        PersistResult::Duplicate => {
+            let resolved = state
+                .db
+                .get_approval_by_stored_hash(tenant.community(), &token_hash)
+                .await
+                .map_err(|e| {
+                    IngestError::Internal(format!("error: reload processed approval: {e}"))
+                })?;
+            if resolved.status != ApprovalStatus::Granted
+                || resolved.approver_pubkey.as_deref() != Some(self_bytes.as_slice())
+            {
+                return Err(IngestError::Internal(
+                    "error: processed approval grant is not reflected in approval state".into(),
+                ));
+            }
+            return Ok(IngestResult {
+                event_id: event.id.to_hex(),
+                accepted: true,
+                message: approval_action_message(
+                    &token_hash_hex,
+                    "granted",
+                    resolved.run_id,
+                    resolved.workflow_id,
+                ),
+            });
+        }
+        PersistResult::Inserted(tx) => tx,
+    };
+
     // 3. Validate approval is pending and not expired
     if approval.status != ApprovalStatus::Pending {
         return Err(IngestError::Rejected(format!(
@@ -1138,18 +1170,6 @@ async fn handle_approval_grant(
     // 4. Validate caller is authorized approver
     check_approver_spec(&approval.approver_spec, &self_hex)?;
     check_approval_channel_access(tenant, state, approval.workflow_id, &self_bytes).await?;
-
-    // Persist the command event — returns open transaction
-    let mut tx = match persist_command_event(state, tenant, event, None).await? {
-        PersistResult::Duplicate => {
-            return Ok(IngestResult {
-                event_id: event.id.to_hex(),
-                accepted: true,
-                message: "duplicate: already processed".into(),
-            });
-        }
-        PersistResult::Inserted(tx) => tx,
-    };
 
     // 5. Execute: update approval status to granted
     let note = if event.content.is_empty() {
@@ -1239,6 +1259,38 @@ async fn handle_approval_deny(
         .await
         .map_err(|_| IngestError::Rejected("invalid: approval not found".into()))?;
 
+    // Recover the authoritative receipt for an exact retry before rejecting
+    // the approval's now-terminal state.
+    let mut tx = match persist_command_event(state, tenant, event, None).await? {
+        PersistResult::Duplicate => {
+            let resolved = state
+                .db
+                .get_approval_by_stored_hash(tenant.community(), &token_hash)
+                .await
+                .map_err(|e| {
+                    IngestError::Internal(format!("error: reload processed approval: {e}"))
+                })?;
+            if resolved.status != ApprovalStatus::Denied
+                || resolved.approver_pubkey.as_deref() != Some(self_bytes.as_slice())
+            {
+                return Err(IngestError::Internal(
+                    "error: processed approval denial is not reflected in approval state".into(),
+                ));
+            }
+            return Ok(IngestResult {
+                event_id: event.id.to_hex(),
+                accepted: true,
+                message: approval_action_message(
+                    &token_hash_hex,
+                    "denied",
+                    resolved.run_id,
+                    resolved.workflow_id,
+                ),
+            });
+        }
+        PersistResult::Inserted(tx) => tx,
+    };
+
     // 3. Validate approval is pending and not expired
     if approval.status != ApprovalStatus::Pending {
         return Err(IngestError::Rejected(format!(
@@ -1258,18 +1310,6 @@ async fn handle_approval_deny(
     // 4. Validate caller is authorized approver
     check_approver_spec(&approval.approver_spec, &self_hex)?;
     check_approval_channel_access(tenant, state, approval.workflow_id, &self_bytes).await?;
-
-    // Persist the command event — returns open transaction
-    let mut tx = match persist_command_event(state, tenant, event, None).await? {
-        PersistResult::Duplicate => {
-            return Ok(IngestResult {
-                event_id: event.id.to_hex(),
-                accepted: true,
-                message: "duplicate: already processed".into(),
-            });
-        }
-        PersistResult::Inserted(tx) => tx,
-    };
 
     // 5. Execute: update approval status to denied
     let note = if event.content.is_empty() {
