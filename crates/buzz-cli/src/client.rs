@@ -4,7 +4,8 @@ use std::time::Duration;
 
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
-use nostr::{EventBuilder, JsonUtil, Keys, Kind, Tag};
+use nostr::filter::MatchEventOptions;
+use nostr::{EventBuilder, Filter, JsonUtil, Keys, Kind, Tag};
 use sha2::{Digest, Sha256};
 
 use crate::error::CliError;
@@ -758,15 +759,73 @@ fn record_query_cursor(
     Ok(())
 }
 
-fn validate_query_response(raw: &str) -> Result<(), CliError> {
+fn parse_query_filters(filters: &[serde_json::Value]) -> Result<Vec<Filter>, CliError> {
+    filters
+        .iter()
+        .enumerate()
+        .map(|(index, raw)| {
+            if let Some(before_id) = raw.get("before_id") {
+                let valid_id = before_id
+                    .as_str()
+                    .is_some_and(|id| id.len() == 64 && id.chars().all(|c| c.is_ascii_hexdigit()));
+                if !valid_id
+                    || raw
+                        .get("until")
+                        .and_then(serde_json::Value::as_u64)
+                        .is_none()
+                {
+                    return Err(CliError::Usage(format!(
+                        "query filter at index {index} has an invalid composite cursor"
+                    )));
+                }
+            }
+            serde_json::from_value::<Filter>(raw.clone()).map_err(|error| {
+                CliError::Usage(format!("invalid query filter at index {index}: {error}"))
+            })
+        })
+        .collect()
+}
+
+fn composite_cursor_matches(raw_filter: &serde_json::Value, event: &nostr::Event) -> bool {
+    let Some(before_id) = raw_filter
+        .get("before_id")
+        .and_then(serde_json::Value::as_str)
+    else {
+        return true;
+    };
+    let Some(until) = raw_filter.get("until").and_then(serde_json::Value::as_u64) else {
+        return false;
+    };
+    let created_at = event.created_at.as_secs();
+    let event_id = event.id.to_hex();
+    let before_id = before_id.to_ascii_lowercase();
+    created_at < until || (created_at == until && event_id.as_str() > before_id.as_str())
+}
+
+fn validate_query_response(
+    raw: &str,
+    raw_filters: &[serde_json::Value],
+    filters: &[Filter],
+) -> Result<(), CliError> {
     let events: Vec<nostr::Event> = serde_json::from_str(raw)
         .map_err(|error| CliError::Other(format!("invalid relay query response: {error}")))?;
+    let match_options = MatchEventOptions::new().nip50(false);
     for (index, event) in events.iter().enumerate() {
         event.verify().map_err(|error| {
             CliError::Other(format!(
                 "relay query event at index {index} failed verification: {error}"
             ))
         })?;
+        let matches_requested_filter =
+            raw_filters.iter().zip(filters).any(|(raw_filter, filter)| {
+                filter.match_event(event, match_options)
+                    && composite_cursor_matches(raw_filter, event)
+            });
+        if !matches_requested_filter {
+            return Err(CliError::Other(format!(
+                "relay query event at index {index} does not match any requested filter"
+            )));
+        }
     }
     Ok(())
 }
@@ -1035,6 +1094,7 @@ impl BuzzClient {
     /// Execute a one-shot query with multiple filters via the HTTP bridge.
     /// Each filter is ORed by the relay (standard Nostr REQ behavior).
     pub async fn query_multi(&self, filters: &[serde_json::Value]) -> Result<String, CliError> {
+        let parsed_filters = parse_query_filters(filters)?;
         let url = format!("{}/query", self.relay_url);
         let body = bytes::Bytes::from(
             serde_json::to_vec(filters)
@@ -1061,7 +1121,7 @@ impl BuzzClient {
                 }
             })
             .await?;
-        validate_query_response(&response)?;
+        validate_query_response(&response, filters, &parsed_filters)?;
         Ok(response)
     }
 
@@ -2904,9 +2964,9 @@ mod retry_policy_tests {
 mod tests {
     use super::{
         advance_query_cursor, create_response_with_id_if_accepted, enforce_query_all_limit,
-        extract_relay_response_field, normalize_relay_url, record_query_cursor, to_ws_url,
-        validate_query_page, validate_query_response, validate_submit_event_response, BuzzClient,
-        QUERY_ALL_MAX_EVENTS,
+        extract_relay_response_field, normalize_relay_url, parse_query_filters,
+        record_query_cursor, to_ws_url, validate_query_page, validate_query_response,
+        validate_submit_event_response, BuzzClient, QUERY_ALL_MAX_EVENTS,
     };
     use nostr::{EventBuilder, Keys, Kind, Tag};
     use std::collections::HashSet;
@@ -3006,19 +3066,76 @@ mod tests {
     }
 
     #[test]
-    fn query_response_requires_verified_nostr_events() {
+    fn query_response_requires_verified_events_matching_a_requested_filter() {
+        let keys = Keys::generate();
         let event = EventBuilder::new(Kind::TextNote, "authentic")
-            .sign_with_keys(&Keys::generate())
+            .sign_with_keys(&keys)
             .unwrap();
         let valid = serde_json::to_string(&vec![event.clone()]).unwrap();
-        assert!(validate_query_response(&valid).is_ok());
-        assert!(validate_query_response("[]").is_ok());
-        assert!(validate_query_response("{}").is_err());
+        let matching = serde_json::json!({
+            "kinds": [1],
+            "authors": [keys.public_key().to_hex()],
+        });
+        let filters = parse_query_filters(std::slice::from_ref(&matching)).unwrap();
+        assert!(validate_query_response(&valid, std::slice::from_ref(&matching), &filters).is_ok());
+        assert!(validate_query_response("[]", std::slice::from_ref(&matching), &filters).is_ok());
+        assert!(validate_query_response("{}", std::slice::from_ref(&matching), &filters).is_err());
+
+        let wrong_kind = serde_json::json!({"kinds": [2]});
+        let wrong_kind_filters = parse_query_filters(std::slice::from_ref(&wrong_kind)).unwrap();
+        assert!(validate_query_response(
+            &valid,
+            std::slice::from_ref(&wrong_kind),
+            &wrong_kind_filters
+        )
+        .is_err());
+
+        let raw_or_filters = vec![wrong_kind, matching.clone()];
+        let or_filters = parse_query_filters(&raw_or_filters).unwrap();
+        assert!(validate_query_response(&valid, &raw_or_filters, &or_filters).is_ok());
+
+        // Relay full-text search can use stemming or extensions, so local
+        // binding enforces every structural field but not search relevance.
+        let search = serde_json::json!({"kinds": [1], "search": "different term"});
+        let search_filters = parse_query_filters(std::slice::from_ref(&search)).unwrap();
+        assert!(
+            validate_query_response(&valid, std::slice::from_ref(&search), &search_filters).is_ok()
+        );
+
+        let cursor_base = serde_json::json!({
+            "kinds": [1],
+            "until": event.created_at.as_secs(),
+        });
+        let mut accepted_cursor = cursor_base.clone();
+        accepted_cursor["before_id"] = serde_json::json!("0".repeat(64));
+        let accepted_filters = parse_query_filters(std::slice::from_ref(&accepted_cursor)).unwrap();
+        assert!(validate_query_response(
+            &valid,
+            std::slice::from_ref(&accepted_cursor),
+            &accepted_filters
+        )
+        .is_ok());
+
+        let mut rejected_cursor = cursor_base;
+        rejected_cursor["before_id"] = serde_json::json!("f".repeat(64));
+        let rejected_filters = parse_query_filters(std::slice::from_ref(&rejected_cursor)).unwrap();
+        assert!(validate_query_response(
+            &valid,
+            std::slice::from_ref(&rejected_cursor),
+            &rejected_filters
+        )
+        .is_err());
+        assert!(parse_query_filters(&[serde_json::json!({
+            "before_id": "0".repeat(64)
+        })])
+        .is_err());
 
         let mut tampered = serde_json::to_value(event).unwrap();
         tampered["content"] = serde_json::json!("changed after signing");
         let tampered = serde_json::to_string(&vec![tampered]).unwrap();
-        assert!(validate_query_response(&tampered).is_err());
+        assert!(
+            validate_query_response(&tampered, std::slice::from_ref(&matching), &filters).is_err()
+        );
     }
 
     #[test]
