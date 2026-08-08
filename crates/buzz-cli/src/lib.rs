@@ -1924,8 +1924,6 @@ fn normalize_auth_tag_input(input: &str) -> String {
 }
 
 async fn run(cli: Cli) -> Result<(), CliError> {
-    let relay_url = client::normalize_relay_url(&cli.relay);
-
     // Pack commands are local-only — no relay connection needed.
     if let Cmd::Pack(ref sub) = cli.command {
         return match sub {
@@ -1969,7 +1967,7 @@ async fn run(cli: Cli) -> Result<(), CliError> {
         _ => (None, None),
     };
 
-    let client = BuzzClient::new(relay_url, keys, auth_tag, auth_tag_json)?;
+    let client = BuzzClient::new(cli.relay, keys, auth_tag, auth_tag_json)?;
 
     match cli.command {
         Cmd::Agents(sub) => commands::agents::dispatch(sub, &client).await,

@@ -597,6 +597,7 @@ impl BuzzClient {
         auth_tag: Option<Tag>,
         auth_tag_json: Option<String>,
     ) -> Result<Self, CliError> {
+        let relay_url = normalize_relay_url(&relay_url)?;
         let http = reqwest::Client::builder()
             .timeout(env_duration_secs("BUZZ_TIMEOUT_SECS", 30))
             .connect_timeout(env_duration_secs("BUZZ_CONNECT_TIMEOUT_SECS", 15))
@@ -1134,7 +1135,7 @@ impl BuzzClient {
     /// `buzz_ws_client::publish_event` which handles connect, NIP-42 auth,
     /// EVENT send, OK wait, and graceful close.
     pub async fn publish_ephemeral_event(&self, event: nostr::Event) -> Result<String, CliError> {
-        let ws_url = to_ws_url(&self.relay_url);
+        let ws_url = to_ws_url(&self.relay_url)?;
         // Hard cap — inner wait ceilings sum to 70 s; connect time and network RTT are
         // additional overhead absorbed by this budget.
         // See buzz_ws_client::{AUTH_CHALLENGE_TIMEOUT_SECS, AUTH_OK_TIMEOUT_SECS,
@@ -1349,20 +1350,67 @@ impl BuzzClient {
     }
 }
 
-/// Normalize a relay URL: ws:// → http://, wss:// → https://, strip trailing slash.
-/// BUZZ_RELAY_URL may be ws/wss (copied from MCP config).
-pub fn normalize_relay_url(url: &str) -> String {
-    url.replace("wss://", "https://")
-        .replace("ws://", "http://")
-        .trim_end_matches('/')
-        .to_string()
+/// Validate and normalize a relay base URL for REST requests.
+///
+/// `BUZZ_RELAY_URL` may use ws/wss (copied from MCP config), which is converted
+/// to http/https. Credentials, queries, and fragments are rejected because this
+/// value is later extended with fixed API paths and carries authentication.
+pub fn normalize_relay_url(raw: &str) -> Result<String, CliError> {
+    let mut url = url::Url::parse(raw.trim())
+        .map_err(|e| CliError::Usage(format!("invalid relay URL: {e}")))?;
+    let http_scheme = match url.scheme() {
+        "http" => "http",
+        "https" => "https",
+        "ws" => "http",
+        "wss" => "https",
+        _ => {
+            return Err(CliError::Usage(
+                "relay URL must use http://, https://, ws://, or wss://".to_string(),
+            ))
+        }
+    };
+    url.set_scheme(http_scheme)
+        .map_err(|_| CliError::Usage("invalid relay URL scheme".to_string()))?;
+    if url.host_str().is_none() {
+        return Err(CliError::Usage("relay URL must contain a host".to_string()));
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err(CliError::Usage(
+            "relay URL must not contain credentials".to_string(),
+        ));
+    }
+    if url.query().is_some() {
+        return Err(CliError::Usage(
+            "relay URL must not contain a query".to_string(),
+        ));
+    }
+    if url.fragment().is_some() {
+        return Err(CliError::Usage(
+            "relay URL must not contain a fragment".to_string(),
+        ));
+    }
+    if url.path() == "/" {
+        url.set_path("");
+    }
+    Ok(url.to_string().trim_end_matches('/').to_string())
 }
 
 /// Convert an HTTP(S) relay base URL back to a WebSocket URL for NIP-01 connections.
-fn to_ws_url(http_url: &str) -> String {
-    http_url
-        .replace("https://", "wss://")
-        .replace("http://", "ws://")
+fn to_ws_url(http_url: &str) -> Result<String, CliError> {
+    let mut url = url::Url::parse(http_url)
+        .map_err(|e| CliError::Usage(format!("invalid relay URL: {e}")))?;
+    let ws_scheme = match url.scheme() {
+        "http" => "ws",
+        "https" => "wss",
+        _ => {
+            return Err(CliError::Usage(
+                "relay URL must use http:// or https://".to_string(),
+            ))
+        }
+    };
+    url.set_scheme(ws_scheme)
+        .map_err(|_| CliError::Usage("invalid relay URL scheme".to_string()))?;
+    Ok(url.to_string())
 }
 
 /// Normalize raw event JSON array into consistent shape.
@@ -2468,11 +2516,44 @@ mod retry_policy_tests {
 mod tests {
     use super::{
         advance_query_cursor, create_response_with_id_if_accepted, extract_relay_response_field,
-        record_query_cursor, validate_query_page, validate_query_response,
-        validate_submit_event_response, BuzzClient,
+        normalize_relay_url, record_query_cursor, to_ws_url, validate_query_page,
+        validate_query_response, validate_submit_event_response, BuzzClient,
     };
     use nostr::{EventBuilder, Keys, Kind, Tag};
     use std::collections::HashSet;
+
+    #[test]
+    fn relay_url_normalization_is_structural_and_fail_closed() {
+        assert_eq!(
+            normalize_relay_url(" WSS://Relay.Example:443/community/ ").unwrap(),
+            "https://relay.example/community"
+        );
+        assert_eq!(
+            normalize_relay_url("ws://localhost:3000").unwrap(),
+            "http://localhost:3000"
+        );
+
+        for invalid in [
+            "ftp://relay.example",
+            "https://user:secret@relay.example",
+            "https://relay.example?tenant=other",
+            "https://relay.example/#fragment",
+            "not a url",
+        ] {
+            assert!(
+                normalize_relay_url(invalid).is_err(),
+                "expected invalid relay URL to fail: {invalid}"
+            );
+        }
+    }
+
+    #[test]
+    fn websocket_conversion_only_changes_the_url_scheme() {
+        assert_eq!(
+            to_ws_url("https://relay.example/community/http://nested").unwrap(),
+            "wss://relay.example/community/http://nested"
+        );
+    }
 
     #[test]
     fn query_cursor_uses_last_events_composite_sort_key() {
