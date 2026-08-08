@@ -600,6 +600,7 @@ impl BuzzClient {
         let http = reqwest::Client::builder()
             .timeout(env_duration_secs("BUZZ_TIMEOUT_SECS", 30))
             .connect_timeout(env_duration_secs("BUZZ_CONNECT_TIMEOUT_SECS", 15))
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .map_err(|e| CliError::Other(e.to_string()))?;
         Ok(Self {
@@ -1777,6 +1778,48 @@ mod retry_policy_tests {
 
         assert!(matches!(err, CliError::DeliveryUnknown(_)));
         assert_eq!(attempts.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn authenticated_event_submission_does_not_follow_redirects() {
+        let sink_hits = Arc::new(AtomicU32::new(0));
+        let sink_state = sink_hits.clone();
+        let sink = Router::new()
+            .route(
+                "/events",
+                post(|State(hits): State<Arc<AtomicU32>>| async move {
+                    hits.fetch_add(1, Ordering::SeqCst);
+                    r#"{"event_id":"abc","accepted":true,"message":""}"#
+                }),
+            )
+            .with_state(sink_state);
+        let sink_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let sink_addr = sink_listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(sink_listener, sink).await.unwrap() });
+
+        let location = format!("http://{sink_addr}/events");
+        let source = Router::new()
+            .route(
+                "/events",
+                post(|State(location): State<String>| async move {
+                    Response::builder()
+                        .status(StatusCode::TEMPORARY_REDIRECT)
+                        .header("location", location)
+                        .body(Body::empty())
+                        .unwrap()
+                }),
+            )
+            .with_state(location);
+        let source_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let source_addr = source_listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(source_listener, source).await.unwrap() });
+
+        let client = test_client(&format!("http://{source_addr}"));
+        let event = make_stored_event(client.keys());
+        let err = client.submit_event(event).await.unwrap_err();
+
+        assert!(matches!(err, CliError::Relay { status: 307, .. }));
+        assert_eq!(sink_hits.load(Ordering::SeqCst), 0);
     }
 
     /// A moderation command (kind 9040) that fails the first attempt with HTTP 429
