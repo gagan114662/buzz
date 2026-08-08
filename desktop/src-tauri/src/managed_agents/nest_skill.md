@@ -122,7 +122,7 @@ buzz messages send --channel <UUID> \
 ## Gotchas
 
 1. **`feed get` sorts newest-first** — every other list command sorts oldest-first. Don't assume consistent sort order.
-2. **`users set-presence` is broken** — sends ephemeral kind:20001 via HTTP POST; relay rejects ephemeral kinds over HTTP. Will fail until WebSocket support is added.
+2. **`users set-presence` publishes over WebSocket** — it performs NIP-42 authentication because ephemeral kind:20001 events are intentionally rejected by the HTTP event bridge.
 3. **`workflow runs` reads authoritative database history** — the relay authenticates the caller and checks current workflow-channel membership before returning runs.
 4. **`dms open` returns `dm_id`** — use this value as `--channel` for subsequent `messages send/get` commands on that DM.
 5. **Content max 65,536 bytes** (exit 1 if exceeded). Diffs auto-truncate at 61,440 bytes at a hunk boundary.
